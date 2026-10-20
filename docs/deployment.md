@@ -556,9 +556,18 @@ The generated adapter verifies many proofs of one kind at once
 (`IZkApiBatchProofAdapter`: `verifyWithdrawalBatch`, `verifyRequestBatch`
 and their `Once` variants). One random linear combination checks n proofs
 with n + 3 pairings and one shared multi-scalar multiplication: about
-49,600 gas per extra proof instead of about 217,000, and a batch of 16
-withdrawals verifies in 998,220 gas against 3,609,818 one by one
-(`protocol/contracts/snapshots/batch-verifier-gas.json`). The challenges are
+49,600 gas per extra withdrawal proof instead of about 226,700 (requests
+49,200 instead of 229,100), and a batch of 16 withdrawals verifies in 997,837
+gas against 3,627,952 one by one (16 requests: 983,045 against 3,666,256;
+`protocol/contracts/snapshots/batch-verifier-gas.json`). A withdrawal item is
+the revision-4, leaf-bound statement (word 3 `noteLeaf`, word 8
+`noteFields`), read through the same input table as the single verifier:
+the narrow fields (protocol version, chain ID, vault, final balance,
+destination, kind, concession and `validUntil`) must be clean (an empty
+revert otherwise), and `noteFields`, a full-width word, gets the
+canonical check of every input (below the scalar field order, else
+`InvalidProof`); the vault's own `noteFields < 2^224` check comes with each
+item's vault call. The challenges are
 128-bit Fiat-Shamir challenges over every byte the batch reads (r_0 = 1),
 and every item gets the single verifier's checks, so a batch is valid
 exactly when each of its items is. The `Once` variants then write the
@@ -566,12 +575,15 @@ record a single verification would have left: for a withdrawal, the record
 of `verifyWithdrawalOnce`; for a request, a record under `REQUEST_RECORD`
 (at or above 2^160, a namespace no withdrawal record can reach) that
 `assertValidRequest` now consults. The vault's own verification of a
-recorded item in the same transaction is a lookup (1,352 gas).
+recorded item in the same transaction is a lookup (2,473 gas for a
+withdrawal, 2,007 for a request).
 `zkapi-proof`'s `batch` module is the reference implementation of the
 transcript and the checks; the shared vectors in
 `protocol/contracts/test/fixtures/batch-verifier-vectors.json` pin both.
 The adapter is immutable per vault (`vault.proofAdapter`), so the batch
-verifier ships with the next vault deployment.
+verifier ships with the next vault deployment. With it the adapter's runtime
+is 19,858 bytes (the EIP-170 limit is 24,576; the vault is 20,810, the
+paymaster 23,848 and the batcher 6,912).
 
 `Deploy.s.sol` then deploys `ZkApiExitBatcher`
 (`protocol/contracts/src/periphery/ZkApiExitBatcher.sol`), which lands many
@@ -579,33 +591,46 @@ exits of one kind in one transaction. It verifies every item's proof up
 front (`verify*BatchOnce`, all or nothing) and then makes each item's
 ordinary vault call (`mutualClose`, `initiateEscapeWithdrawal`,
 `challengeEscapeWithdrawal`, `raiseEscapeConcession`,
-`finalizeEscapeWithdrawal`) with exactly its kind's gas cap. An item whose
-state changed (its owner closed or escaped the note first, an escape
-already defeated or finalized) is skipped with `ItemSkipped`, as is one
-whose call runs out of its cap or whose payout push fails. The batch itself
-is never starved into a skip: after verification it requires every item's
-worst case up front (`n · cap · 64/63` plus overheads), and before each
-call that the call can get its whole cap; otherwise the whole transaction
-reverts `BatchOutOfGas`. So `eth_estimateGas` of the exact batch already
-covers destinations that burn their gas at inclusion. It is stateless,
-holds no ETH, takes no admin and is bound to one vault, so it can be
-redeployed at will. `gasBound(kinds)` returns an upper bound of a batch's
-execution gas (the call's entry, `VERIFY_BASE_GAS + n · VERIFY_ITEM_GAS` for
-the verification, measured on the worst case with 10% to spare, and the
-reserve; a call given exactly that lands every kind); a relayer sends at
-least that and never less than `eth_estimateGas`. The challenger batches defeats and raises through it
+`finalizeEscapeWithdrawal`) with exactly its kind's gas cap. An item the vault
+refuses is skipped with `ItemSkipped(index, kind, noteId, reason)`, `reason`
+being the vault's revert data and, for a close or an escape, `noteId` the
+statement's `noteFields >> 192`. For a close or an escape the vault checks the
+note before the proof, so the reasons include `NoteNotActive` (its owner
+closed or escaped the note first, or it was retired), `NoteLeafMismatch` (the
+statement's leaf is not the stored one: a valid proof over a deposit or expiry
+the vault did not store) and `InvalidNoteFields` (`noteFields` of 2^224 or
+more), besides `ReplayedNullifier`, `ProofExpired`, `Paused` and, for defeats,
+raises and finalizations, an escape already defeated, raised or finalized. An
+item whose call runs out of its cap (an empty reason) or whose payout push
+fails (`NativeTransferFailed`) is skipped too. No exit item carries a root or
+a Merkle path. The batch itself is never starved into a skip: after
+verification it requires every item's worst case up front (`n · cap · 64/63`
+plus overheads), and before each call that the call can get its whole cap;
+otherwise the whole transaction reverts `BatchOutOfGas`. So `eth_estimateGas`
+of the exact batch already covers destinations that burn their gas at
+inclusion. It is stateless, holds no ETH, takes no admin and is bound to one
+vault, so it can be redeployed at will. `gasBound(kinds)` returns an upper
+bound of a batch's execution gas (the call's entry,
+`VERIFY_BASE_GAS + n · VERIFY_ITEM_GAS` for the verification, measured on the
+worst case with 10% to spare, and the reserve; a call given exactly that
+lands every kind); a relayer sends at least that and never less than
+`eth_estimateGas`. The challenger batches defeats and raises through it
 ([challenge operation](challenge-service.md)), and serverd's close relay
 lands cooperative closes through it ([API](api-spec.md)).
 
 Its per-kind caps are immutables chosen for the chain's gas schedule.
 `test/batch/BatcherGas.t.sol` measures each kind's vault call in a batch,
-cold: a close about 61,000, an escape 114,000, a defeat 42,000, a raise
-18,000 and a finalization 36,000. The caps add what the call may hand on: a
+cold (`item_*` in `snapshots/exit-batcher-gas.json`): a close 58,533, an
+escape 109,611, a defeat 39,947, a raise 18,491 and a finalization 36,507.
+Each cap is the measurement plus what the call may hand on and a margin,
+rounded up to the next 50,000 (the measurements moved little under
+leaf-bound statements, and no cap changed). What a call may hand on: a
 close pays the treasury with up to 100,000 gas (`TREASURY_PAYOUT_GAS`) and
 the destination with all that is left, and a finalization pushes up to
 100,000 to each. Under EIP-8037 a fresh storage slot costs about 88,000
-more and a new account 158,600 more: an escape writes four fresh slots, a
-close one plus, for a never-used destination, the account. The defaults are
+more and a new account 158,600 more, which the cap adds: an escape writes
+four fresh slots, a close one plus, for a never-used destination, the
+account. The defaults are
 therefore 250,000 (close), 250,000 (escape), 150,000 (defeat), 150,000
 (raise) and 300,000 (finalize) under EIP-2929 pricing, and 500,000, 600,000,
 150,000, 150,000 and 400,000 under EIP-8037. The script measures a fresh
@@ -626,13 +651,13 @@ execution, every account cold, refunds capped at a fifth; `snapshots/exit-batche
 
 | Exit | Single | Batch of 1 | 2 | 4 | 8 | 16 |
 |---|---|---|---|---|---|---|
-| close | 307,710 | 322,077 | 231,114 | 172,960 | 143,909 | 129,395 |
-| escape | 367,185 | 382,020 | 284,919 | 226,773 | 197,726 | 183,214 |
-| defeat | 286,960 | 301,994 | 198,437 | 140,320 | 111,274 | 96,766 |
-| raise | 277,479 | 292,568 | 191,981 | 135,359 | 107,072 | 92,933 |
-| finalize | 45,063 | 49,836 | 37,528 | 32,518 | 30,013 | 28,760 |
+| close | 312,236 | 326,652 | 230,105 | 172,438 | 143,622 | 129,226 |
+| escape | 369,834 | 384,630 | 283,007 | 225,867 | 197,307 | 183,044 |
+| defeat | 284,904 | 299,938 | 197,363 | 139,752 | 110,965 | 96,575 |
+| raise | 277,943 | 293,032 | 192,481 | 135,853 | 107,562 | 93,430 |
+| finalize | 45,131 | 49,904 | 37,583 | 32,572 | 30,067 | 28,815 |
 
-A batch of one costs 5,000 to 15,000 more than the single call, so a relayer
+A batch of one costs 4,800 to 15,100 more than the single call, so a relayer
 with one item calls the vault directly. Manifest fields: `exitBatcher`,
 `exitBatcherRuntimeCodehash`, `exitBatcherGasSchedule` (`eip2929` or
 `eip8037`), `exitBatcherFreshSlotGas` and `exitBatcherItemGas { close,

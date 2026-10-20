@@ -209,24 +209,30 @@ current state whose payload is exactly
 `{"mode":"close_relay_fee","version":1,"fee_units":"<fee>","ticket_hash":"0x<64 hex>"}`
 (unknown fields are refused), with `ticket_hash =
 keccak256("zkapi:v2c:close-relay-ticket\0" || secret)` of a fresh 32-byte
-secret. It is admitted like any request (fresh root, state key, request time,
-authorization tag, Groth16 proof) with `solvency_bound >= fee`, settled at
+secret. It is admitted like any request (a root serverd read from the
+vault, state key, request time, authorization tag, Groth16 proof) with
+`solvency_bound >= fee`, settled at
 once at exactly the fee, and answered with the signed successor
 (`RequestResponseV2`, `charge_applied` = fee, payload
 `{"status":"relay_fee_paid",...}`). An exact retry returns the same
 successor; recovery (`GET /v2/requests/{id}`) serves it too. Prove the close
-at that successor.
+at that successor. A `stale_root` while the vault's `currentRoot()` still
+reports the request's root means serverd has not read that root yet (as
+right after a deposit): send the same body again; only a root the vault no
+longer holds needs a new request.
 
 `POST /v2/withdraw/relay` takes `CloseRelaySubmissionV2C`,
 `{public_inputs, proof, ticket_secret}` (unknown fields refused):
-`public_inputs` is the kind-1 `WithdrawalPublicInputsV2C` and `proof` the
-Groth16 proof exactly as `mutualClose` takes them. The server requires this
-deployment and its keys, kind 1 with no successor or concession, a destination
-that is neither zero nor the vault, `valid_until` at least
-`min_validity_seconds` ahead, a valid proof, a nullifier unused on chain, its
-own clearance at the nullifier, and a paid ticket that redeemed no other
-close. It answers `202` with `CloseRelayStatusResponse` when it queued the
-close, and `200` with the current status for the same close submitted again.
+`public_inputs` is the kind-1
+`WithdrawalPublicInputsV2C` (the leaf-bound statement: `note_leaf`, `note_id`,
+`deposit_amount` and `expiry_ts`, no root) and `proof` the Groth16 proof
+exactly as `mutualClose` takes them. The server requires this deployment and
+its keys, kind 1 with no successor or concession, a destination that is
+neither zero nor the vault, `valid_until` at least `min_validity_seconds`
+ahead, a valid proof, a nullifier unused on chain, its own clearance at the
+nullifier, and a paid ticket that redeemed no other close. It answers `202`
+with `CloseRelayStatusResponse` when it queued the close, and `200` with the
+current status for the same close submitted again.
 `GET /v2/withdraw/relay/{withdrawal_nullifier}` returns the status, or `404`
 `{"status":"not_found"}`.
 
@@ -236,7 +242,9 @@ self_submit}`, where `status` is `queued`, `submitted` (in a relay transaction
 not yet confirmed; `transaction_hash` is its latest hash), `landed` (the
 vault's `MutualClose` for it was emitted in the relay's transaction),
 `closed` (closed by another transaction), `failed` (never relayed again, for
-example a payout push that failed) or `expired` (too near `valid_until`).
+example a payout push that failed, or a leaf-bound refusal,
+`NoteLeafMismatch` or `InvalidNoteFields`) or `expired` (too near
+`valid_until`, or its proof expired).
 `self_submit` is true for `failed` and `expired`. Clients confirm the payout
 from the vault's `MutualClose` event in every case.
 

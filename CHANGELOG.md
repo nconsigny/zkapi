@@ -40,19 +40,26 @@ Folded into 0.2.0's notes at release.
   `verifyRequestBatch` and their `Once` variants), with one random linear
   combination (128-bit Fiat-Shamir challenges over every byte read, `r_0 = 1`)
   and every check of the single verifier: n + 3 pairings and one shared
-  multi-scalar multiplication, so 16 withdrawals verify in 998,220 gas
-  instead of 3,609,818. The `Once` variants leave the records a single
-  verification would (requests under `REQUEST_RECORD`, which
-  `assertValidRequest` now consults). `zkapi-proof`'s `batch` module is the
-  reference implementation; shared vectors pin both. The new
-  `ZkApiExitBatcher` (`src/periphery`), deployed with every vault by
+  multi-scalar multiplication, so 16 withdrawals verify in 997,837 gas
+  instead of 3,627,952 (16 requests 983,045 instead of 3,666,256). Withdrawal
+  items are the revision-4, leaf-bound statements, read through the same
+  input table: `noteFields` (input 8) is a full-width word, checked as a
+  canonical field element rather than as a narrow field. The `Once` variants
+  leave the records a single verification would (requests under
+  `REQUEST_RECORD`, which `assertValidRequest` now consults). `zkapi-proof`'s
+  `batch` module is the reference implementation; shared vectors pin both.
+  The new `ZkApiExitBatcher` (`src/periphery`), deployed with every vault by
   `Deploy.s.sol` (`EXIT_BATCHER_*_GAS`; manifest `exitBatcher*`, profile
   `exit_batcher_*`), verifies a batch once and makes each item's ordinary
-  vault call under a per-kind gas cap, skipping an item whose state changed
-  and never starving one (`BatchOutOfGas`). Per exit at 16 items: close
-  129,395 gas instead of 307,710, escape 183,214 instead of 367,185, defeat
-  96,766 instead of 286,960, raise 92,933 instead of 277,479, finalize 28,760
-  instead of 45,063 ([Batched exits](docs/deployment.md#batched-exits)).
+  vault call under a per-kind gas cap, never starving one (`BatchOutOfGas`).
+  An item the vault refuses is skipped with `ItemSkipped` and the vault's
+  reason (a close's or an escape's note taken from `noteFields >> 192`):
+  among others `NoteNotActive`, `NoteLeafMismatch` (a valid proof over a
+  deposit or expiry the vault did not store) and `InvalidNoteFields`. Per
+  exit at 16 items: close 129,226 gas instead of 312,236, escape 183,044
+  instead of 369,834, defeat 96,575 instead of 284,904, raise 93,430 instead
+  of 277,943, finalize 28,815 instead of 45,131
+  ([Batched exits](docs/deployment.md#batched-exits)).
 - **The challenger batches defeats and raises** through the exit batcher's
   `challengeBatch` when the profile names one: deadline-aware flushing (full,
   aged, or near a deadline; single calls inside the critical threshold), an
@@ -64,10 +71,15 @@ Folded into 0.2.0's notes at release.
   ([challenge operation](docs/challenge-service.md)).
 - **Operator close relay (optional).** `zkapi serverd --relay-*` relays
   cooperative closes through the exit batcher from a dedicated relayer whose
-  signer runs in the new `ZKAPI_SIGNER_ROLE=close-relay`. The fee is one
-  metered request at the note's state before the clearance, settled at
-  exactly the fee and redeemed by a ticket secret, so it lands in the treasury
-  share with no circuit change. New endpoints `GET /v2/withdraw/relay/terms`,
+  signer runs in the new `ZKAPI_SIGNER_ROLE=close-relay` (the leaf-bound
+  `mutualClose` `0xbce12a6c` and `mutualCloseBatch` `0x30d07036` only,
+  refusing `noteFields` of 2^224 or more). The fee is one metered request at
+  the note's state before the clearance, admitted at a root serverd read
+  from the vault like any request, settled at exactly the fee and redeemed
+  by a ticket secret, so it lands in the treasury share with no circuit
+  change. A close the vault refuses with `NoteLeafMismatch` or
+  `InvalidNoteFields` is failed and never relayed again; `NoteNotActive` is
+  decided from `noteRecord`. New endpoints `GET /v2/withdraw/relay/terms`,
   `POST /v2/withdraw/relay/fee`, `POST /v2/withdraw/relay` and
   `GET /v2/withdraw/relay/{nullifier}`; clients opt in with
   `zkapi-clientd withdraw --fees relay` or the SDK's
@@ -75,6 +87,14 @@ Folded into 0.2.0's notes at release.
   or that has not landed by `valid_until` minus 20 minutes, and count a
   withdrawal done only when its `MutualClose` appears
   ([close relay](docs/native-eth-billing.md)).
+- **zkapi-clientd can opt out of transit-account reuse.**
+  `withdraw --fees payout --fresh-transit` gives one gasless withdrawal a
+  fresh transit account, and `config --transit-accounts fresh`
+  (`zkapi.transit_accounts`; `per-payee`, the default, clears it) does so
+  for every one. The owner key is then drawn at random and journaled without
+  `owner_derivation`, and the withdrawal pays `S`'s creation again (about
+  89,000 gas on mainnet, about 535,000 under EIP-8037) in exchange for not
+  linking it to the wallet's other withdrawals to that payout address.
 
 ### Changed
 
@@ -262,10 +282,17 @@ Folded into 0.2.0's notes at release.
   refuse a second sponsored escape from one transit account while the first
   is open (`transit_escape_pending`, before any proof). Exits of one wallet to
   one payout address are now visibly linked through their shared transit
-  account.
+  account; zkapi-clientd can opt out (see Added).
 - **Single defeats and raises cost about 600 gas more** (the adapter's
-  request-record lookup), and the adapter's larger dispatch adds about 170 to
-  every single exit; the adapter's runtime is 19,885 bytes.
+  request-record lookup), and the adapter's larger dispatch adds about 160 to
+  a single close or escape. Against the leaf-bound tree without the batch
+  verifier: `challengeEscapeWithdrawal` 282,199 → 282,804,
+  `raiseEscapeConcession` 272,137 → 272,742, `mutualClose` 331,773 →
+  331,936, `initiateEscapeWithdrawal` 366,851 → 367,010; finalizations and
+  `claimExpired` are unchanged. A sponsored close with the real adapter
+  costs the float 531,013 → 531,294 gas (`actualGasUsed`), an escape
+  initiation 642,650 → 643,476. The adapter's runtime is 19,858 bytes (the
+  EIP-170 limit is 24,576).
 
 ### Fixed
 
@@ -279,14 +306,34 @@ Folded into 0.2.0's notes at release.
   operations of one sender, and states that verify-once's record on a
   first-use operation relies on STO-022, which makes the factory's stake
   load-bearing.
+- **A deposit activated on one RPC's word.** zkapi-clientd activated a
+  deposit from the payment RPC's receipt and `noteRecord` whenever the
+  indexer had no view of the receipt block. It now needs a second source: the
+  indexer's view once it has applied that block, or else the owner's exit
+  RPC serving the receipt's block hash as canonical (EIP-1898
+  `requireCanonical`) and the same `Active` leaf at it (the binding records
+  `exit_rpc_confirmed`). Without either the deposit stays pending and is
+  checked again on every poll; another leaf on the exit RPC is a
+  verification conflict.
+- **The companion confirmed a deposit it could not see.** `/deposit/confirm`
+  installed the note when `noteRecord` was empty (an RPC lagging the
+  deposit) or unreadable. Both now answer `deposit_pending` (HTTP 503,
+  retry) and install nothing, and a deployment without an RPC is refused.
+- **A relay fee request refused `stale_root` right after a deposit** was set
+  aside with its ticket, although serverd had merely not read the vault's
+  new root yet. The SDK and the companion now resend the byte-identical request
+  (after 2, 4, 8 and 16 s) while the pinned vault still holds its root, keep
+  it journaled with its ticket if serverd still lags, and set it aside only
+  once the vault's root moved; the acceptance's relayed close no longer
+  waits for the indexer after the SDK's deposit.
 
 ### Breaking
 - **`deposit(bytes32 commitment, uint128 amount)`** (selector `0x56d2e1ea`)
   replaces `deposit(bytes32,uint128,uint256[32])`: the siblings argument is
-  gone. The SDK (`encodeDeposit`) and zkapi-clientd send the new calldata and
-  keep the deposit-time path locally for the note's exit proof; clientd ties
-  a prepared deposit slot to its signed transaction by nonce
-  (`signed_nonce`) rather than by the calldata's sibling words.
+  gone. The SDK (`encodeDeposit`) and zkapi-clientd send the new calldata
+  (revision 4's exits, below, need no path at all); clientd ties a prepared
+  deposit slot to its signed transaction by nonce (`signed_nonce`) rather
+  than by the calldata's sibling words.
 - **The note tree's roots change** (see Changed): proofs, paths and roots
   from any earlier deployment or fixture do not carry over, and the browser
   bundle (`sdk/wasm`) must be rebuilt with `scripts/build-browser-client.sh
@@ -304,9 +351,10 @@ Folded into 0.2.0's notes at release.
   `supportsInterface` (ERC-165), and the paymaster refuses a vault whose
   adapter lacks them (`BadVault`).
 - **`pendingWithdrawals` word 1 (`activeRoot`) is always zero.** The vault
-  never read the escape proof's root and no longer stores it; the escape's
-  calldata carries it. The getter keeps its 6 words and selector. The SDK's
-  `readBrowserWithdrawalStatus` no longer returns `active_root`.
+  never read the escape proof's root and no longer stores it (revision 4's
+  escape statement carries no root at all). The getter keeps its 6 words and
+  selector. The SDK's `readBrowserWithdrawalStatus` no longer returns
+  `active_root`.
 - **Gasless withdrawals are not deployed on Sepolia** for now: it prices state
   creation under EIP-8037, and the paymaster refuses that schedule (see
   Changed). Deploy Sepolia vaults with `GASLESS=0`, and run the gasless drills
@@ -391,13 +439,15 @@ Folded into 0.2.0's notes at release.
   `exitBatcherFreshSlotGas`, `exitBatcherItemGas` and
   `deployTransactions.exitBatcher`, the `trusted_deployment` profile
   `exit_batcher_address`, `exit_batcher_runtime_codehash` and
-  `exit_batcher_item_gas`. A vault deployed before this release keeps its
-  adapter (it is immutable) and has no batch verifier: its profile carries
-  null batcher fields and every exit stays a single call.
+  `exit_batcher_item_gas`. The batch verifier ships only with a new
+  revision-4 vault (the adapter is immutable); a manifest without the
+  batcher gives null batcher fields, and every exit stays a single call. The
+  batcher's `mutualCloseBatch` (`0x30d07036`) takes the leaf-bound tuple;
+  `initiateEscapeBatch` is `0xc8a43572` and `challengeBatch` `0xab41c746`.
 - **The challenge signer** accepts `ZKAPI_CHALLENGE_EXIT_BATCHER`,
   `ZKAPI_CHALLENGE_BATCH_MAX_ITEMS` and `ZKAPI_SIGNER_ROLE`; a request body may
   now be up to 256 KB.
-- None: the change is additive. Profiles without `gasless` (or with
+- **Gasless withdrawals are additive.** Profiles without `gasless` (or with
   `gasless: null`) keep working with the wallet-pays path.
 
 ## [0.2.0] - not yet released

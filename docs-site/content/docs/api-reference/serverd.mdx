@@ -263,15 +263,19 @@ payload must be exactly
 `{"mode":"close_relay_fee","version":1,"fee_units":"<fee>","ticket_hash":"0x<64 hex>"}`.
 `fee_units` is the current fee from the terms, and `ticket_hash` is
 `keccak256("zkapi:v2c:close-relay-ticket\0" || secret)` of a fresh 32-byte
-secret. The server admits it with every check of a request, with a solvency
-bound of at least the fee. It settles the request at once at exactly the fee
+secret. The server admits it with every check of a request, including a
+membership root it read from the vault itself, with a solvency bound of at
+least the fee. A `stale_root` while the vault still reports the request's
+root means the server has not read that root yet, as right after a deposit:
+send the same body again. It settles the request at once at exactly the fee
 and signs the successor: `charge_applied` is the fee, and the response payload
 is `{"status":"relay_fee_paid",...}`. The client installs that successor, asks
 for clearance there, and proves the close at it. The close therefore pays the
 treasury the fee within `deposit - finalBalance`.
 
 The submission carries the close's statement and proof exactly as
-`mutualClose` takes them, together with the ticket's secret. Only the holder of
+`mutualClose` takes them (the leaf-bound statement: the note's leaf and
+fields, no root or path), together with the ticket's secret. Only the holder of
 the secret can redeem a paid fee, and it redeems one close. The server checks
 the following:
 
@@ -297,7 +301,8 @@ within `cutoff_seconds` of `valid_until` is given back to its client.
   transaction, given in `transaction_hash`.
 - `closed`: another transaction closed the note.
 - `failed`: the relay never sends the close again. For example, the payout
-  push failed.
+  push failed, or the vault refused the statement's leaf or fields
+  (`NoteLeafMismatch`, `InvalidNoteFields`).
 - `expired`: the close is too near its `valid_until`.
 
 `self_submit` is true for `failed` and `expired`. The client then sends

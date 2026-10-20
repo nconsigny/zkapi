@@ -63,7 +63,10 @@ account: its proof names a transit account derived from the owner and the
 payout address (one per owner and payout address: the browser SDK's owner is
 the connected account, zkapi-clientd derives its owner key per payout address
 from its payment key, so later exits to the same payout address reuse the
-account and skip its creation), and a user operation from that account, sent through the
+account and skip its creation, which links them on chain; its
+`--fresh-transit` and `config --transit-accounts fresh` draw a random owner
+and a new account per withdrawal instead), and a user operation from that
+account, sent through the
 operator's ERC-4337 bundler, makes the vault call. The withdrawal paymaster
 re-runs the vault's checks in validation, sponsors the gas from its EntryPoint
 deposit, and in postOp keeps a measured charge and pushes the rest to the
@@ -76,6 +79,8 @@ application integrates the browser SDK directly. The separate [zkapi-clientd](..
 OpenAI-compatible API backed by private native ETH balances. Its Rust
 wallet/prover companion, `zkapi-walletd`, is built from this repository's
 `crates/zkapi-companion` at a pinned commit. It has no ticket mode or token
-wallet. It checks deposits and withdrawals against the vault and the
-operator's indexer before changing private state, and escapes without the
+wallet. It checks deposits and withdrawals against the vault before
+changing private state (a deposit also against a second source: the
+operator's indexer, or, while the indexer has no view of the deposit's
+block, the user's exit RPC), and escapes without the
 operator, through the user's own exit RPC when one is configured.

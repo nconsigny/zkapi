@@ -404,8 +404,10 @@ of 10 gas per calldata token), and never below `eth_estimateGas` plus 20%, the
 margin every challenge gets. The estimate already covers the batcher's
 up-front reserve, so a destination or vault call cannot starve the batch. The
 [transaction fee ceiling](#transaction-fee-ceiling) applies at that gas limit:
-about 3M gas for 16 items at the Mainnet item caps allows about 333 gwei per
-gas at 1 ETH.
+16 defeats at the Mainnet item caps bound 3,998,080 execution gas (16 x
+(150,000 x 64/63 + 15,000) + 20,000 + 10,000 + 330,000 + 16 x 60,000), about
+4.2M with the intrinsic and calldata gas, which allows about 238 gwei per gas
+at 1 ETH.
 
 **The nonce lane.** A batch takes one nonce. Every member's obligation holds
 that nonce with a mirrored attempt record (hashes, fees, gas limit, attempts)

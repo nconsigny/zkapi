@@ -295,7 +295,7 @@ allows at the default 1 ETH are:
 | Defeat (`challengeEscapeWithdrawal`) | 600,000, or the estimate plus 20% when higher | about 1,666 gwei |
 | Raise (`raiseEscapeConcession`) | 450,000, or the estimate plus 20% when higher | about 2,222 gwei |
 | Leaf retirement (`retireClosedLeaf`, after a missed defeat) | the estimate plus 20%: at most about 1.1M | about 900 gwei |
-| Batch of n defeats and raises (`challengeBatch`) | the batcher's `gasBound(kinds)` plus intrinsic and calldata gas, or the estimate plus 20% when higher; about 3M for 16 items at the Mainnet item caps | about 333 gwei for 16 items |
+| Batch of n defeats and raises (`challengeBatch`) | the batcher's `gasBound(kinds)` plus intrinsic and calldata gas, or the estimate plus 20% when higher; about 4.2M for 16 items at the Mainnet item caps | about 238 gwei for 16 items |
 
 A revision-4 retirement reads only the siblings below ℓ = msb(noteId XOR
 nextNoteId), the level at which the note's path meets the frontier, and the

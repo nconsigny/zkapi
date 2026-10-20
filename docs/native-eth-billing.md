@@ -273,7 +273,10 @@ The operator may relay cooperative closes: clients hand a finished close to
 serverd, which submits closes in batches through the deployment's
 permissionless `ZkApiExitBatcher` (`mutualCloseBatch`), about 4x cheaper per
 close than a sponsored gasless close and less than half a single
-`mutualClose` at 16 closes per batch. It is off unless configured, and it
+`mutualClose` at 16 closes per batch. A relayed close is the ordinary
+revision-4 close: its statement names the note's leaf and packed fields
+(`noteFields`), carries no root or Merkle path, and the vault checks the
+note before the proof. It is off unless configured, and it
 needs the deployment manifest's `exit_batcher_address` (startup runs
 `probe_exit_batcher`: codehash, vault, adapter and item gas caps). Relay mode
 is opt-in for clients; the wallet-paid and gasless paths are unchanged. The
@@ -284,9 +287,17 @@ API is in [api-spec.md](api-spec.md#close-relay).
 The fee is one metered request, with no circuit change. Before preparing the
 withdrawal, the client makes one request at its current state `k` with the
 payload `{"mode":"close_relay_fee","version":1,"fee_units":"<fee>","ticket_hash":...}`
-(`POST /v2/withdraw/relay/fee`). serverd admits it like any request
-(solvency bound at least the fee), settles it at once at exactly the fee, and
-signs the successor `k+1` with the fee deducted. The client then asks for
+(`POST /v2/withdraw/relay/fee`). serverd admits it like any request: its
+membership proof is at a root serverd read from the vault's `currentRoot()`
+itself, the latest or one replaced within `request_root_grace_seconds`,
+never an indexer root, and its solvency bound is at least the fee. It
+settles the request at once at exactly the fee and signs the successor
+`k+1` with the fee deducted. Right after a deposit a client can read the new
+root before serverd's poller does and get `stale_root`; while the pinned
+vault still holds that root, the SDK and the companion resend the
+byte-identical request (after 2, 4, 8 and 16 s) and, if serverd still lags,
+keep it journaled with its ticket for the next attempt. Only a root the vault
+no longer holds sets the request aside. The client then asks for
 clearance at `N_{k+1}` and proves its close there, so the fee is part of the
 close's treasury share `deposit - finalBalance`. The request's reservation,
 evidence, settled charge and ticket are written in one transaction. The close
@@ -320,18 +331,24 @@ a close comes within `--relay-urgent-margin-seconds` of its `valid_until`
 Before sending, the worker `eth_call`s the exact batch. Every proof is
 verified first, so one bad proof reverts the whole batch; the worker then
 bisects it. A lone close is sent to `vault.mutualClose` directly, since a
-batch of one costs about 16.5k more. The gas limit is `batcher.gasBound(kinds)`
+batch of one costs about 14.4k more. The gas limit is `batcher.gasBound(kinds)`
 plus 21,000 and the calldata gas (or the EIP-7623 floor), and never below
 `eth_estimateGas`. Fees are `min(2 x baseFee + tip, --relay-max-fee-per-gas)`.
 While the base fee is above that cap the queue waits.
 
 Each skipped close is classified from the vault's refusal:
 
-- **Done (`closed`).** The note was closed by another transaction, usually
-  the client's own.
+- **Done (`closed`).** `NoteNotActive` or `ReplayedNullifier`, and the
+  vault's `noteRecord(noteId)` shows the note `Closed`: another transaction
+  closed it, usually the client's own. A note that is not `Closed` (an
+  escape is pending) makes the close `failed`.
 - **`failed`, never relayed again.** The payout push failed
   (`NativeTransferFailed`), or the close ran out of its gas cap, for example
-  a destination that burns the gas. The client submits it itself.
+  a destination that burns the gas. The client submits it itself. The
+  leaf-bound refusals are named failures too: `NoteLeafMismatch` (the
+  statement's leaf is not the note's stored one) and `InvalidNoteFields`
+  (`noteFields` of 2^224 or more), as is any other named vault refusal.
+- **`expired`.** `ProofExpired`.
 - **Back to the queue.** The vault is paused.
 
 A batch that reverts as a whole puts its closes back, counting an attempt. A
@@ -367,16 +384,17 @@ per-close gas(B) ~= (verification bound(B) + B x itemGas(close) x 64/63 + overhe
 fee_units        ~= per-close gas(B) x max_fee_per_gas (gwei) x (1 + margin)
 ```
 
-With the measured verification cost (1,004,340 gas for 16 proofs, about
-62.8k each) and the mainnet close cap of 150,000:
+With the measured verification cost (1,006,359 gas for 16 proofs with their
+records, about 62.9k each) and the mainnet close cap of 250,000:
 
-- **Worst case at B = 16.** The bound is about 62.8k + 152.4k + 12k, roughly
-  230k gas per close.
-- **Typical at B = 16.** A real batch costs 129,477 gas per close (measured).
-- **Single close.** A lone `mutualClose` is about 307.5k gas.
+- **Worst case at B = 16.** The bound is about 62.9k + 254.0k + 12k, roughly
+  329k gas per close.
+- **Typical at B = 16.** A real batch costs 129,226 gas per close (measured,
+  `close_n16` in `protocol/contracts/snapshots/exit-batcher-gas.json`).
+- **Single close.** A lone `mutualClose` is about 312.2k gas.
 
-At a 5 gwei cap and a 20% margin, the worst case at B = 16 is 230,000 x 5 x
-1.2 = 1,380,000 units (0.00138 ETH). A fee priced for B = 16 does not cover a
+At a 5 gwei cap and a 20% margin, the worst case at B = 16 is 329,000 x 5 x
+1.2 = 1,974,000 units (0.001974 ETH). A fee priced for B = 16 does not cover a
 lone close flushed at age T. Either raise T so that batches fill, or price
 for the batch size the queue actually reaches. Read `itemGas(0)` and
 `gasBound` from the chain: caps are chain-specific (larger under EIP-8037).

@@ -1443,28 +1443,37 @@ After the Groth16 verification of the kind-2 proof, the server reads `noteRecord
 
 ### A3.8 Measured (dev setup, EIP-2929 pricing)
 
-Separate cold transactions (`protocol/contracts/test/GasBaseline.t.sol`), revision 3 on the left:
+Separate cold transactions (`protocol/contracts/test/GasBaseline.t.sol`), revision 3 on the left. Revision 4 is measured with the batch verifier in the adapter (A3.10), whose larger dispatch costs a single exit about 160 gas and a single defeat or raise about 600 (its request-record check); before it the revision-4 exits measured 312,073 (close), 369,651 (escape), 284,299 / 309,220 (defeat) and 277,437 (raise):
 
 | Operation | Revision 3 | Revision 4 |
 |---|---|---|
 | `deposit` #0 / #2 | 605,598 / 573,516 | 68,327 / 68,327 |
 | `deposit` #255 / #1023 (first writes of `filled[8]`, `filled[10]`) | 605,442 / 609,678 | 213,318 / 243,986 |
 | `deposit`, average of the first 64 | 579,889 | 87,633 |
-| `mutualClose` (relayed) | 307,547 | 312,073 |
-| `initiateEscapeWithdrawal` | 367,002 | 369,651 |
-| `challengeEscapeWithdrawal` (no grace / grace written) | 286,403 | 284,299 / 309,220 |
-| `raiseEscapeConcession` | 276,913 | 277,437 |
+| `mutualClose` (relayed) | 307,547 | 312,236 |
+| `initiateEscapeWithdrawal` | 367,002 | 369,810 |
+| `challengeEscapeWithdrawal` (no grace / grace written) | 286,403 | 284,904 / 309,825 |
+| `raiseEscapeConcession` | 276,913 | 278,042 |
 | `finalizeEscapeWithdrawal` (net of refunds) | 56,613 | 56,681 |
 | `claimExpired` (no epoch / 1 / 32 epochs) | 50,503 | 62,361 / 64,862 / 76,642 |
 | `retireClosedLeaf` (the same closed note) | 939,846 | 71,960 (level 1) |
 | `retireClosedLeaf`, levels 0 / 4 / 8 / 16, unused siblings zero-filled | n/a | 37,678 / 151,928 / 258,540 / 471,788 |
 | `recordRoot` | n/a | 465,036 (2 notes) to 542,904 |
 
-The exits above are of the fixture's notes 0 and 1, whose revision-3 statements skipped a scalar multiplication (a `noteId` input of 0 or 1); `noteFields` always takes one (about 6,200 gas), so for any note ID of 3 or more the revision-3 exits were about 6,200 gas dearer than listed and revision 4 is cheaper by the removed `knownRoots` read. The pinned snapshot (`snapshots/concession-exit-gas.json`, deposits inside the measured test) is 366,851 (escape), 282,199 (defeat), 272,137 (raise), 331,773 (close), 80,381 (finalize) and 84,561 (claim). The vault's runtime is 20,810 bytes (18,833 in revision 3).
+The exits above are of the fixture's notes 0 and 1, whose revision-3 statements skipped a scalar multiplication (a `noteId` input of 0 or 1); `noteFields` always takes one (about 6,200 gas), so for any note ID of 3 or more the revision-3 exits were about 6,200 gas dearer than listed and revision 4 is cheaper by the removed `knownRoots` read. The pinned snapshot (`snapshots/concession-exit-gas.json`, deposits inside the measured test, with the batch verifier in the adapter, A3.10) is 367,010 (escape), 282,804 (defeat), 272,742 (raise), 331,936 (close), 80,381 (finalize) and 84,561 (claim). The vault's runtime is 20,810 bytes (18,833 in revision 3).
 
 ### A3.9 Migration
 
 Revision 4 is a new vault with a new setup; revision-3 keys, statements and profiles are refused. Revision-3 deposits stay in the revision-3 vault and exit there. The runbook is [Migrating to the concession-exit vault](../migration-concession-vault.md).
+
+### A3.10 Batched exits under leaf-bound statements
+
+The batch verifier, `ZkApiExitBatcher`, the challenger's batched defeats and raises, the close relay and per-payee transit reuse were built against revision 3 and ported to the revision-4 statement; operation is in [Batched exits](../deployment.md#batched-exits), [challenge operation](../challenge-service.md#batched-defeats-and-raises) and [close relay](../native-eth-billing.md#close-relay).
+
+- **Batch verification.** `verifyWithdrawalBatch` and `verifyRequestBatch` (`IZkApiBatchProofAdapter`, generated into the adapter) check n proofs with one random linear combination: n + 3 pairings and one shared multi-scalar multiplication, every item with the single verifier's checks over the same input table. In the withdrawal table input 3 is `noteLeaf` and input 8 `noteFields`; both are full-width words (input 8 was the narrow `uint32 noteId`), so the batch verifier checks them as canonical field elements (`InvalidProof`), not as narrow fields, and `noteFields < 2^224` stays the vault's check. Sixteen withdrawals verify in 997,837 gas against 3,627,952 one by one, about 49,600 per extra proof; the adapter's runtime is 19,858 bytes.
+- **Skips.** The batcher verifies every item once (`verify*BatchOnce`, all or nothing) and then makes each item's ordinary vault call under its kind's gas cap, so the vault's A3.2 checks run per item. An item the vault refuses is skipped with `ItemSkipped`, whose note ID for a close or an escape is `noteFields >> 192`. Besides `ReplayedNullifier`, `ProofExpired`, `Paused`, `NativeTransferFailed` and an empty reason (out of the item's cap), a close or an escape is skipped with `NoteNotActive` (closed, escaping or retired), `NoteLeafMismatch` (a valid proof whose leaf is not the stored one, for example over a deposit or expiry the vault did not store) or `InvalidNoteFields`. A skip moves no funds and costs the batch only its item's gas; the owner can submit the exit alone.
+- **Close relay fee.** The relay fee is one ordinary metered request at the note's state `k`, settled at exactly the fee, after which the close is cleared and proved at `N_{k+1}`; it needs no circuit change and binds no root into the close. The request is admitted under O5' (A3.4) at a root serverd read from the vault itself. A client that reads a new root (after a deposit) before serverd's poller gets `stale_root`; while the pinned vault still holds that root, the SDK and the companion resend the byte-identical request (keeping it journaled with its ticket while serverd still lags) and set it aside only once the vault's root moved. serverd classifies `NoteLeafMismatch` and `InvalidNoteFields` as failures it never relays again, and decides `NoteNotActive` from `noteRecord`: `Closed` is done, anything else failed.
+- **Transit reuse.** zkapi-clientd derives the transit account's owner key per payout address from its payment key (HKDF-SHA256), and the SDK's owner is the connected account, so every sponsored withdrawal of one wallet to one payout address uses one `S`. Reuse saves the account's creation (about 89,000 gas on mainnet, about 535,000 under EIP-8037) but links those withdrawals on chain, which distinguishes them from other users' at a shared payout address. zkapi-clientd opts out with `withdraw --fees payout --fresh-transit` (one withdrawal) or `config --transit-accounts fresh` (`zkapi.transit_accounts`): a random owner key journaled without `owner_derivation` and a new `S`, whose creation is paid again. Because `escapeNotePlusOne(S)` is written in postOp, the paymaster takes a transient per-transit-account escape lock in validation, and both clients refuse a second sponsored escape from one `S` while the first is open (`transit_escape_pending`).
 
 ---
 

@@ -544,18 +544,25 @@ await client.withdraw('mutual', onStatus, { destination, fees: 'relay' });
 
 The client first pays the fee as one ordinary private request at the note's
 current state: the browser wallet proves it like a chat request (its payload
-is `{"mode":"close_relay_fee","version":1,"fee_units","ticket_hash"}`), and
-installs the signed successor, which carries the fee as spent. The ticket
-secret behind `ticket_hash` is kept with the wallet and sent only with the
-close. The cooperative close is then cleared and proved at that successor, so
-its treasury share holds the fee, and handed to the relay. The call resolves
-like a wallet-paid close once the vault's `MutualClose` of exactly this close
-is on chain, whichever transaction carried it (read through the wallet's
-provider). If the relay reports the close `failed` or `expired`, or has not
-landed it 20 minutes before its proof expires, the same call asks the wallet
-to send the close itself (the ordinary path, MetaMask confirmation included).
-The relay can only submit the proof or not: it binds the destination and the
-amount. Escapes cannot be relayed (`fees: 'relay'` with `'escape'` is a
+is `{"mode":"close_relay_fee","version":1,"fee_units","ticket_hash"}`), at a
+root the pinned vault reports (the indexer's path only once the vault
+confirms its root, else rebuilt from vault state), and installs the signed
+successor, which carries the fee as spent. No indexer wait is needed after a
+deposit: a `stale_root` while the vault still holds the request's root means
+serverd has not read that root yet, so the SDK resends the same request
+(after 2, 4, 8 and 16 s), keeps it journaled with its ticket if serverd still
+lags, and sets it aside only once the vault's root moved. The ticket secret
+behind `ticket_hash` is kept with the wallet and sent only with the close.
+The cooperative close is then cleared and proved at that successor (bound to
+the note's leaf, like every close), so its treasury share holds the fee, and
+handed to the relay. The call resolves like a wallet-paid close once the
+vault's `MutualClose` of exactly this close is on chain, whichever
+transaction carried it (read through the wallet's provider). If the relay
+reports the close `failed` or `expired`, or has not landed it 20 minutes
+before its proof expires, the same call asks the wallet to send the close
+itself (the ordinary path, MetaMask confirmation included). The relay can
+only submit the proof or not: it binds the destination and the amount.
+Escapes cannot be relayed (`fees: 'relay'` with `'escape'` is a
 `TypeError`); `fees: 'payout'` is unchanged.
 
 The building blocks are exported as `@openanonymity/zkapi-browser-sdk/close-relay`

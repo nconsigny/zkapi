@@ -290,9 +290,10 @@ paths:
         The payload is exactly {"mode":"close_relay_fee","version":1,
         "fee_units":"<fee>","ticket_hash":"0x<64 hex>"}, ticket_hash being
         keccak256("zkapi:v2c:close-relay-ticket\0" || secret) of a fresh
-        32-byte secret. Admitted like any request with solvency_bound at
-        least the fee, settled at exactly the fee, answered with the signed
-        successor. Prove the cooperative close at that successor.
+        32-byte secret. Admitted like any request (at a root serverd read
+        from the vault) with solvency_bound at least the fee, settled at
+        exactly the fee, answered with the signed successor. Prove the
+        cooperative close at that successor.
       requestBody:
         required: true
         content:
@@ -317,7 +318,9 @@ paths:
         "409":
           description: >-
             relay_fee_changed (read the terms again), relay_ticket_taken (draw
-            a new secret), stale_root, replay or nullifier_used
+            a new secret), stale_root (while the vault's currentRoot() still
+            reports the request's root, serverd has not read it yet: resend
+            the same body), replay or nullifier_used
           content:
             application/json:
               schema: {$ref: "#/components/schemas/ErrorResponse"}

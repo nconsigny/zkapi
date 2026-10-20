@@ -19,7 +19,9 @@ deployment's exit batcher (see [Batched challenges](#batched-challenges)):
 | --- | --- | --- |
 | `challengeBatch(uint32[], uint128[], RequestPublicInputs[], bytes)` | `0xab41c746` | Defeat (amount 0) and raise several escapes in one transaction. |
 
-The three vault ABIs are those of vault revision 3. A revision-4 retirement reads
+The three vault ABIs are unchanged from vault revision 3 (vault revision 4
+changed the withdrawal statement, not the request statement these calls
+carry). A revision-4 retirement reads
 only `siblings[0..ℓ)`, where ℓ = msb(noteId XOR nextNoteId) is the level at
 which the note's path meets the tree's frontier; the challenger zero-fills the
 rest (at ℓ = 0 the vault reads none). The signer signs any canonical encoding
