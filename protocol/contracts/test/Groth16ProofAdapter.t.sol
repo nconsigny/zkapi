@@ -4,6 +4,7 @@ pragma solidity ^0.8.28;
 import {Test} from "forge-std/Test.sol";
 import {Groth16ProofAdapter} from "../src/adapters/Groth16ProofAdapter.sol";
 import {IZkApiProofAdapter} from "../src/interfaces/IZkApiProofAdapter.sol";
+import {IZkApiBatchProofAdapter} from "../src/interfaces/IZkApiBatchProofAdapter.sol";
 import {Types} from "../src/libraries/Types.sol";
 import {Errors} from "../src/libraries/Errors.sol";
 
@@ -176,6 +177,7 @@ contract Groth16ProofAdapterTest is Test {
         assertEq(type(IZkApiProofAdapter).interfaceId, bytes4(0x90c99ce1));
         assertFalse(folded.supportsInterface(0xd6b84058), "zkapi-v2-concession-v1's interface ID");
         assertTrue(folded.supportsInterface(type(IZkApiProofAdapter).interfaceId));
+        assertTrue(folded.supportsInterface(type(IZkApiBatchProofAdapter).interfaceId));
         assertTrue(folded.supportsInterface(0x01ffc9a7));
         assertFalse(folded.supportsInterface(0xffffffff));
         assertFalse(folded.supportsInterface(IZkApiProofAdapter.assertValidWithdrawal.selector));

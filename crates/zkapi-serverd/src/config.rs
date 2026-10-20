@@ -305,6 +305,8 @@ pub struct ServerConfig {
     /// finalized at its settlement deadline without a usage measurement.
     /// Off by default; startup otherwise refuses until they drain.
     pub allow_key_source_switch: bool,
+    /// The operator's close relay (`crate::close_relay`): off unless set.
+    pub close_relay: Option<crate::close_relay::CloseRelayConfig>,
 }
 
 impl ServerConfig {
@@ -449,6 +451,7 @@ impl std::fmt::Debug for ServerConfig {
             challenge_period_seconds,
             deployment,
             allow_key_source_switch,
+            close_relay,
         } = self;
         formatter
             .debug_struct("ServerConfig")
@@ -480,6 +483,8 @@ impl std::fmt::Debug for ServerConfig {
                     .map(|manifest| &manifest.contract_address),
             )
             .field("allow_key_source_switch", allow_key_source_switch)
+            // CloseRelayConfig's Debug redacts its RPC URL.
+            .field("close_relay", close_relay)
             .finish()
     }
 }
@@ -510,6 +515,7 @@ impl Default for ServerConfig {
             challenge_period_seconds: None,
             deployment: None,
             allow_key_source_switch: false,
+            close_relay: None,
         }
     }
 }

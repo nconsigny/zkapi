@@ -9,7 +9,10 @@
 // its codehash, which Deploy.s.sol checks). A deployment with the gasless-withdrawal paymaster adds
 // the paymaster's, the transit-account factory's and the account logic's deployedBytecode with
 // their immutables filled the same way, and the two canonical ERC-4337 v0.7.0 runtimes (the
-// EntryPoint and its SenderCreator), which are pinned constants. Anyone can rebuild the artifacts
+// EntryPoint and its SenderCreator), which are pinned constants. A deployment with the exit batcher
+// (exitBatcher; every manifest of the current Deploy.s.sol has one) adds ZkApiExitBatcher's
+// deployedBytecode with its immutables filled from the vault, the adapter and the manifest's
+// exitBatcherItemGas. Anyone can rebuild the artifacts
 // from source (protocol/contracts/foundry.toml pins solc, via_ir (off for the Poseidon runtime),
 // 10,000 runs, bytecode_hash "none" and cbor_metadata false) and audit a deployment. The manifest
 // keeps the field names poseidonLibrary, poseidonLibraryReused and poseidonRuntimeCodehash: they
@@ -42,7 +45,9 @@
 // requires its creation receipt (the factory and the account logic are created by constructors
 // and are checked by their code), its EntryPoint deposit of at least the manifest's initial
 // deposit, its stake and the factory's, and its policy, fee ceilings, gas policy, fee keeper and
-// owner (or nominated owner) to be the manifest's. Only then does it write OUT: the manifest with
+// owner (or nominated owner) to be the manifest's. With the exit batcher it requires its creation
+// receipt and its runtime codehash (the batcher has no storage: its code and immutables are all of
+// it). Only then does it write OUT: the manifest with
 // deploymentStatus "deployed", deployBlock (the block that created the vault, the indexer's and the
 // profiles' deploy_block) and deployTransactions. Any mismatch exits 1 and any other failure exits
 // 2; neither writes OUT. A manifest with withdrawalPaymaster null (GASLESS=0) carries no gasless
@@ -502,6 +507,30 @@ export function gaslessImmutables(inputs) {
     };
 }
 
+/// The kinds of ZkApiExitBatcher's item gas immutables, in its kind order.
+export const EXIT_BATCHER_KINDS = Object.freeze(['close', 'escape', 'defeat', 'raise', 'finalize']);
+
+/// Whether `inputs` describe a deployment with the exit batcher (exitBatcher set, not null).
+export function hasExitBatcher(inputs) {
+    return inputs.exitBatcher !== undefined && inputs.exitBatcher !== null;
+}
+
+/// ZkApiExitBatcher's immutables, by name, as 32-byte hex words: the vault, its adapter and the
+/// item gas caps of the manifest's exitBatcherItemGas.
+export function exitBatcherImmutables(inputs) {
+    const itemGas = inputs.exitBatcherItemGas ?? fail('exitBatcherItemGas is missing');
+    const values = {
+        vault: word(address(inputs.vault, 'vault'), 'vault'),
+        adapter: word(address(inputs.proofAdapter, 'proofAdapter'), 'proofAdapter'),
+    };
+    for (const kind of EXIT_BATCHER_KINDS) {
+        const gas = uint(itemGas[kind], 64, `exitBatcherItemGas.${kind}`);
+        if (gas < 50_000n || gas > 2_000_000n) fail(`exitBatcherItemGas.${kind} ${gas} is outside 50000..2000000`);
+        values[`${kind}Gas`] = word(gas, `exitBatcherItemGas.${kind}`);
+    }
+    return values;
+}
+
 /// Whether `inputs` describe a deployment with the paymaster (withdrawalPaymaster set, not null).
 export function hasGasless(inputs) {
     return inputs.withdrawalPaymaster !== undefined && inputs.withdrawalPaymaster !== null;
@@ -535,6 +564,9 @@ export function expectedRuntimeCode(artifactsDir, inputs) {
     if (runtimeArtifact.metadata?.settings?.viaIR) fail('Bn254PoseidonRuntime was compiled with via_ir; its pinned codehash is the legacy pipeline\'s');
 
     const code = { vault: `0x${vault}`, adapter: `0x${adapter}`, poseidon: `0x${runtime}` };
+    if (hasExitBatcher(inputs)) {
+        code.exitBatcher = `0x${filledRuntimeCode('ZkApiExitBatcher', artifact(artifactsDir, 'ZkApiExitBatcher'), exitBatcherImmutables(inputs))}`;
+    }
     if (!hasGasless(inputs)) return code;
     const immutables = gaslessImmutables(inputs);
     code.paymaster = `0x${filledRuntimeCode('ZkApiWithdrawalPaymaster', artifact(artifactsDir, 'ZkApiWithdrawalPaymaster'), immutables.paymaster)}`;
@@ -550,6 +582,7 @@ export function expectedCodehashes(artifactsDir, inputs) {
         adapter_runtime_codehash: keccak256(hexToBytes(code.adapter)),
         poseidon_runtime_codehash: keccak256(hexToBytes(code.poseidon)),
     };
+    if (code.exitBatcher) hashes.exit_batcher_runtime_codehash = keccak256(hexToBytes(code.exitBatcher));
     if (code.paymaster) {
         hashes.paymaster_runtime_codehash = keccak256(hexToBytes(code.paymaster));
         hashes.factory_runtime_codehash = keccak256(hexToBytes(code.factory));
@@ -644,6 +677,8 @@ export function deploymentInputs(deployment, overrides = {}) {
         vault: deployment.vault,
         chainId: deployment.chainId,
         withdrawalPaymaster: deployment.withdrawalPaymaster ?? null,
+        exitBatcher: deployment.exitBatcher ?? null,
+        exitBatcherItemGas: deployment.exitBatcherItemGas,
         ...overrides,
     };
     if (hasGasless(inputs)) {
@@ -676,6 +711,9 @@ export async function auditDeployment({ artifacts, deployment, overrides = {}, c
         compare('deployment', 'vault_runtime_codehash', deployment.vaultRuntimeCodehash);
         compare('deployment', 'adapter_runtime_codehash', deployment.adapterRuntimeCodehash);
         compare('deployment', 'poseidon_runtime_codehash', deployment.poseidonRuntimeCodehash);
+        if (hasExitBatcher(inputs)) {
+            compare('deployment', 'exit_batcher_runtime_codehash', deployment.exitBatcherRuntimeCodehash);
+        }
         if (gasless) {
             compare('deployment', 'paymaster_runtime_codehash', deployment.paymasterRuntimeCodehash);
             compare('deployment', 'factory_runtime_codehash', deployment.factoryRuntimeCodehash);
@@ -689,6 +727,9 @@ export async function auditDeployment({ artifacts, deployment, overrides = {}, c
         compare('rpc', 'vault_runtime_codehash', await codehashAt(rpc, address(vault, 'vault')));
         compare('rpc', 'adapter_runtime_codehash', await codehashAt(rpc, address(inputs.proofAdapter, 'proofAdapter')));
         compare('rpc', 'poseidon_runtime_codehash', await codehashAt(rpc, address(inputs.poseidonLibrary, 'poseidonLibrary')));
+        if (hasExitBatcher(inputs)) {
+            compare('rpc', 'exit_batcher_runtime_codehash', await codehashAt(rpc, address(inputs.exitBatcher, 'exitBatcher')));
+        }
         if (gasless) {
             compare('rpc', 'paymaster_runtime_codehash', await codehashAt(rpc, address(inputs.withdrawalPaymaster, 'withdrawalPaymaster')));
             compare('rpc', 'factory_runtime_codehash', await codehashAt(rpc, address(inputs.withdrawalAccountFactory, 'withdrawalAccountFactory')));
@@ -798,6 +839,7 @@ export async function finalizeDeployment({ artifacts, deployment, broadcastLog, 
     const creations = { vault: deployment.vault, proofAdapter: deployment.proofAdapter };
     if (deployment.poseidonLibraryReused !== true) creations.poseidonLibrary = deployment.poseidonLibrary;
     if (gasless) creations.withdrawalPaymaster = deployment.withdrawalPaymaster;
+    if (hasExitBatcher(deployment)) creations.exitBatcher = deployment.exitBatcher;
     const transactions = {};
     const blocks = {};
     for (const [role, target] of Object.entries(creations)) {
@@ -876,6 +918,7 @@ const FLAGS = {
     '--account-implementation': 'withdrawalAccountImplementation',
     '--wei-per-unit': 'nativeAssetWeiPerUnit',
     '--creation-code-keccak': 'accountCreationCodeKeccak256',
+    '--exit-batcher': 'exitBatcher',
 };
 
 function parseArgs(argv) {

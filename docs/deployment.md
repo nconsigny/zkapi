@@ -162,6 +162,7 @@ name the runtime contract.
 | `PAYMASTER_ESCAPES` | `1` sponsors escape initiations; default `0` (finalizations are always sponsored) |
 | `PAYMASTER_MAX_FEE_CEILING_WEI`, `PAYMASTER_PRIORITY_FEE_CEILING_WEI` | Fee ceilings per gas the paymaster accepts; defaults 100 gwei and 3 gwei (a testnet: 200 gwei), at most 500 gwei and 20 gwei, and the priority ceiling must not exceed the max ceiling |
 | `PAYMASTER_FEE_KEEPER` | Optional key that may re-set the fee ceilings (`setFeeCeilings`) |
+| `EXIT_BATCHER_CLOSE_GAS`, `EXIT_BATCHER_ESCAPE_GAS`, `EXIT_BATCHER_DEFEAT_GAS`, `EXIT_BATCHER_RAISE_GAS`, `EXIT_BATCHER_FINALIZE_GAS` | Gas of each kind's vault call in a [batch](#batched-exits) (50,000 to 2,000,000). Defaults follow the gas schedule the script measures: 250,000, 250,000, 150,000, 150,000 and 300,000 under EIP-2929 storage pricing (Mainnet today); 500,000, 600,000, 150,000, 150,000 and 400,000 under EIP-8037 (Sepolia today) |
 
 The setup policy is enforced by the script: off local chains (Mainnet
 included) a single-party setup needs `ALLOW_DEV_SETUP=1`, and an `mpc-1` setup
@@ -549,6 +550,101 @@ policy, loss metrics and open debts of a finalized deployment as JSON; see
 [Operating gasless withdrawals](#operating-gasless-withdrawals) for the
 float, the bundler, the fee ceilings, alerts and incident levers.
 
+### Batched exits
+
+The generated adapter verifies many proofs of one kind at once
+(`IZkApiBatchProofAdapter`: `verifyWithdrawalBatch`, `verifyRequestBatch`
+and their `Once` variants). One random linear combination checks n proofs
+with n + 3 pairings and one shared multi-scalar multiplication: about
+49,600 gas per extra proof instead of about 217,000, and a batch of 16
+withdrawals verifies in 998,220 gas against 3,609,818 one by one
+(`protocol/contracts/snapshots/batch-verifier-gas.json`). The challenges are
+128-bit Fiat-Shamir challenges over every byte the batch reads (r_0 = 1),
+and every item gets the single verifier's checks, so a batch is valid
+exactly when each of its items is. The `Once` variants then write the
+record a single verification would have left: for a withdrawal, the record
+of `verifyWithdrawalOnce`; for a request, a record under `REQUEST_RECORD`
+(at or above 2^160, a namespace no withdrawal record can reach) that
+`assertValidRequest` now consults. The vault's own verification of a
+recorded item in the same transaction is a lookup (1,352 gas).
+`zkapi-proof`'s `batch` module is the reference implementation of the
+transcript and the checks; the shared vectors in
+`protocol/contracts/test/fixtures/batch-verifier-vectors.json` pin both.
+The adapter is immutable per vault (`vault.proofAdapter`), so the batch
+verifier ships with the next vault deployment.
+
+`Deploy.s.sol` then deploys `ZkApiExitBatcher`
+(`protocol/contracts/src/periphery/ZkApiExitBatcher.sol`), which lands many
+exits of one kind in one transaction. It verifies every item's proof up
+front (`verify*BatchOnce`, all or nothing) and then makes each item's
+ordinary vault call (`mutualClose`, `initiateEscapeWithdrawal`,
+`challengeEscapeWithdrawal`, `raiseEscapeConcession`,
+`finalizeEscapeWithdrawal`) with exactly its kind's gas cap. An item whose
+state changed (its owner closed or escaped the note first, an escape
+already defeated or finalized) is skipped with `ItemSkipped`, as is one
+whose call runs out of its cap or whose payout push fails. The batch itself
+is never starved into a skip: after verification it requires every item's
+worst case up front (`n · cap · 64/63` plus overheads), and before each
+call that the call can get its whole cap; otherwise the whole transaction
+reverts `BatchOutOfGas`. So `eth_estimateGas` of the exact batch already
+covers destinations that burn their gas at inclusion. It is stateless,
+holds no ETH, takes no admin and is bound to one vault, so it can be
+redeployed at will. `gasBound(kinds)` returns an upper bound of a batch's
+execution gas (the call's entry, `VERIFY_BASE_GAS + n · VERIFY_ITEM_GAS` for
+the verification, measured on the worst case with 10% to spare, and the
+reserve; a call given exactly that lands every kind); a relayer sends at
+least that and never less than `eth_estimateGas`. The challenger batches defeats and raises through it
+([challenge operation](challenge-service.md)), and serverd's close relay
+lands cooperative closes through it ([API](api-spec.md)).
+
+Its per-kind caps are immutables chosen for the chain's gas schedule.
+`test/batch/BatcherGas.t.sol` measures each kind's vault call in a batch,
+cold: a close about 61,000, an escape 114,000, a defeat 42,000, a raise
+18,000 and a finalization 36,000. The caps add what the call may hand on: a
+close pays the treasury with up to 100,000 gas (`TREASURY_PAYOUT_GAS`) and
+the destination with all that is left, and a finalization pushes up to
+100,000 to each. Under EIP-8037 a fresh storage slot costs about 88,000
+more and a new account 158,600 more: an escape writes four fresh slots, a
+close one plus, for a never-used destination, the account. The defaults are
+therefore 250,000 (close), 250,000 (escape), 150,000 (defeat), 150,000
+(raise) and 300,000 (finalize) under EIP-2929 pricing, and 500,000, 600,000,
+150,000, 150,000 and 400,000 under EIP-8037. The script measures a fresh
+slot (`FRESH_SLOT_PROBE`, through the RPC) to choose between them, and
+`EXIT_BATCHER_*_GAS` overrides either; a broadcast whose RPC does not answer
+the probe needs all five set, since forge's own EVM always prices state as
+EIP-2929 does (a dry run without an RPC falls back to it). A cap too small
+for a kind only skips its items (their owners can always submit them alone):
+a close cap below about 160,000 skips closes whose treasury takes its whole
+100,000-gas push, a finalization cap below about 250,000 those whose
+destination and treasury both do. A larger cap only raises the reserve a
+batch must carry. A proof whose destination is the batcher itself is the
+prover's own mistake: its close is skipped (the batcher refuses ETH), and an
+escape's payout would be credited to the batcher, which can never claim it.
+
+Measured transaction gas per exit on this tree (21,000 + calldata +
+execution, every account cold, refunds capped at a fifth; `snapshots/exit-batcher-gas.json`):
+
+| Exit | Single | Batch of 1 | 2 | 4 | 8 | 16 |
+|---|---|---|---|---|---|---|
+| close | 307,710 | 322,077 | 231,114 | 172,960 | 143,909 | 129,395 |
+| escape | 367,185 | 382,020 | 284,919 | 226,773 | 197,726 | 183,214 |
+| defeat | 286,960 | 301,994 | 198,437 | 140,320 | 111,274 | 96,766 |
+| raise | 277,479 | 292,568 | 191,981 | 135,359 | 107,072 | 92,933 |
+| finalize | 45,063 | 49,836 | 37,528 | 32,518 | 30,013 | 28,760 |
+
+A batch of one costs 5,000 to 15,000 more than the single call, so a relayer
+with one item calls the vault directly. Manifest fields: `exitBatcher`,
+`exitBatcherRuntimeCodehash`, `exitBatcherGasSchedule` (`eip2929` or
+`eip8037`), `exitBatcherFreshSlotGas` and `exitBatcherItemGas { close,
+escape, defeat, raise, finalize }`. `expected-codehashes.mjs` derives the
+batcher's runtime code with its immutables (the vault, the adapter, the five
+caps) filled from the manifest, `--check` and `--rpc` compare
+`exit_batcher_runtime_codehash`, and `--finalize` requires its creation
+receipt (`deployTransactions.exitBatcher`). The `trusted_deployment`
+profile carries `exit_batcher_address`, `exit_batcher_runtime_codehash` and
+`exit_batcher_item_gas` (null for a manifest without the batcher), which
+serverd and the challenger read; clients ignore them.
+
 ## Runtime
 
 The [Docker guide](../docker/aws/README.md) configures API, indexer, gateway,
@@ -696,14 +792,25 @@ bundler's second validation, and ERC-7562 GREP-040 lets that bundler ban the
 paymaster at once. Only the operator's whitelisting bundler is reliable, so it
 is the supported default.
 
-The paymaster also holds a per-key in-flight lock (`SponsorshipInFlight` in
-`ZkApiWithdrawalPaymaster.sol`). It refuses, in validation, a second
-sponsorship of the same key in one bundle, because the EntryPoint validates a
-whole bundle before it executes any of it. A compliant bundler never bundles
-two operations of one sender, so the lock fires only against a non-compliant
-or malicious bundler. When it fires, the whole bundle fails on-chain
-validation: the bundler pays, nothing is counted, and GREP-040 lets that
-bundler ban the paymaster. Clients replace a pending operation only at the
+The paymaster also holds transient in-flight locks (`SponsorshipInFlight` in
+`ZkApiWithdrawalPaymaster.sol`), because the EntryPoint validates a whole
+bundle before it executes any of it. In validation they refuse a second
+sponsorship of the same key (the same close replayed at the next nonce), of
+the same note (an escape and a close of one note, or closes at two of its
+nullifiers), and a second sponsored escape from the same transit account.
+The last one protects the forward evidence: `escapeNotePlusOne(S)` is
+written in postOp, so two escapes of different notes from one `S`, validated
+together, would both pass the one-open-escape check and the second record
+would overwrite the first escape's. ERC-4337 and ERC-7562 do not forbid a
+bundler from including several operations of one sender in a bundle: the
+mempool holds several operations of a sender with consecutive nonces, and a
+bundler may include them together. So the locks can fire against a compliant
+bundler too, not only against a non-compliant or malicious one. When one
+fires, the whole bundle fails on-chain validation: the bundler pays, nothing
+is counted, and GREP-040 lets that bundler ban the paymaster. A bundler's
+pre-send simulation returns the `FailedOp` at its index, so it drops that
+operation and resubmits the rest; clients reusing one transit account per
+payee therefore never keep two sponsored escapes from one `S` in flight. Clients replace a pending operation only at the
 same nonce (a fee bump), and never build a new operation for a key while an
 older one may still be in a mempool. Configure the operator's bundler so
 that, while an operation is pending for a (sender, nonce key), it rejects
@@ -751,11 +858,16 @@ policy: recompute them with `gasFields` whenever it changes.
 
 **Stakes.** Never `unlockStake` the paymaster or the factory while the
 paymaster sponsors. The factory's stake lifts the public mempool's
-per-factory limits for operations that create `S`. It is also what ERC-7562
-relies on for a first use: validation writes the adapter's transient record
-at a slot associated with `S` (STO-021) while `S` is created by the same
-operation, which the rules allow in a non-entity contract only with a staked
-factory. Withdraw it only with the paymaster's. The
+per-factory limits for operations that create `S`. It is also load-bearing
+for ERC-7562 compliance: validation verifies through the adapter's
+`verifyWithdrawalOnce`, whose `TSTORE` writes the transient verify-once
+record at a slot associated with `S` (`keccak256(S ‖ h)`) in the adapter, a
+non-entity contract. Once `S` exists, STO-021 admits that write. A first-use
+operation creates `S` through its own `initCode`, and then only STO-022
+admits it, and STO-022 requires the factory to be staked. Without the
+factory's stake every first-use sponsored CLOSE and ESCAPE fails a compliant
+bundler's simulation (reused transit accounts keep working). Withdraw it
+only with the paymaster's. The
 factory's code stays deployed (it is immutable): every `S` address depends
 on it, and its `createAccount` keeps working for sweeps without any stake.
 

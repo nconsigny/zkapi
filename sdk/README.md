@@ -531,6 +531,38 @@ that state:
   client clock up to five minutes fast. The SDK proves again after
   `proof_expired`.
 
+#### The operator's close relay
+
+When the protocol server relays cooperative closes (`GET
+/v2/withdraw/relay/terms` reports `enabled: true`), a mutual withdrawal can
+be landed by the operator in a batch for its relay fee instead of a network
+fee from the wallet. It is opt-in:
+
+```js
+await client.withdraw('mutual', onStatus, { destination, fees: 'relay' });
+```
+
+The client first pays the fee as one ordinary private request at the note's
+current state: the browser wallet proves it like a chat request (its payload
+is `{"mode":"close_relay_fee","version":1,"fee_units","ticket_hash"}`), and
+installs the signed successor, which carries the fee as spent. The ticket
+secret behind `ticket_hash` is kept with the wallet and sent only with the
+close. The cooperative close is then cleared and proved at that successor, so
+its treasury share holds the fee, and handed to the relay. The call resolves
+like a wallet-paid close once the vault's `MutualClose` of exactly this close
+is on chain, whichever transaction carried it (read through the wallet's
+provider). If the relay reports the close `failed` or `expired`, or has not
+landed it 20 minutes before its proof expires, the same call asks the wallet
+to send the close itself (the ordinary path, MetaMask confirmation included).
+The relay can only submit the proof or not: it binds the destination and the
+amount. Escapes cannot be relayed (`fees: 'relay'` with `'escape'` is a
+`TypeError`); `fees: 'payout'` is unchanged.
+
+The building blocks are exported as `@openanonymity/zkapi-browser-sdk/close-relay`
+(`closeRelayFeePayload`, `closeRelayTicketHash`, `submitCloseRelay`,
+`closeRelayStatus`, `decideCloseRelay`, `followCloseRelay`,
+`mutualCloseLogMatches`).
+
 #### Paying the fee from the payout
 
 On a deployment whose profile pins the gasless contracts (`trusted_deployment.
@@ -563,9 +595,33 @@ sends a transaction. The SDK derives `S` locally and cross-checks it with
 (`error.data.reason: "gasless_deployment_mismatch"`), which disables only
 this path, never deposits or wallet-paid exits.
 
+`S` is therefore one account per (connected account, payout address): every
+later sponsored withdrawal of that account to the same payout address reuses
+it. The operation carries `initCode` (`factory.createAccount`) only while `S`
+has no code, read through the read RPC when the operation is built, and is
+then sized with the verification floor without `initCode`; a bundler that
+reports `S` created meanwhile (`AA10`) gets the operation rebuilt without it.
+Closes from one `S` are independent (each uses its withdrawal nullifier as
+its nonce key), but the paymaster keeps one open sponsored escape per `S`
+(the record its forward of that escape's payout needs), so
+`withdraw('escape', …, { fees: 'payout' })` is refused before any proof with
+`transit_escape_pending` while an earlier sponsored escape from `S` is open:
+recorded by this browser and still pending, its finalization or forward in
+flight or its payout waiting in `S`, or recorded by the paymaster
+(`escapeNotePlusOne(S)` naming a pending escape, or a finalized one whose
+payout is still in `S`). Finalize and collect that escape first, or start
+this one with `{ fees: 'wallet' }`. zkapi-clientd, which signs with a key of
+its own, derives that key per payout address from its payment key
+(HKDF-SHA256, `deriveTransitOwnerKey` in `@openanonymity/zkapi-browser-sdk/gasless`,
+for a host that signs locally the same way); its transit accounts behave the
+same.
+
 Privacy: the connected account becomes the on-chain owner of `S` (it appears
 in the account's creation data) and, by default, the payout address. A fresh
-account, which needs no ETH, breaks the link to any funding history. The
+account, which needs no ETH, breaks the link to any funding history, and
+gets a transit account of its own: the withdrawals of one account to one
+payout address share `S`, so they are visibly one owner's even where other
+users pay to that address too. The
 reads of this path (the account's code and nonce, the paymaster's policy, the
 dry run, the logs, the bundle receipt) go to the exit RPC when one is set and
 on the vault's chain, then to the pinned RPC, never to the wallet provider,
@@ -992,7 +1048,7 @@ Each of these errors carries a `shortMessage` for display.
 | Exit kit | `exit_kit_invalid`, `exit_kit_passphrase`, `exit_kit_passphrase_weak` |
 | Request path rebuild | `tree_root_mismatch`, `tree_state_unavailable`, `tree_state_invalid`, `tree_logs_unavailable`, `tree_note_missing`, `tree_event_invalid`, `tree_rebuild_timeout`, `wrong_network` (each with `error.data.request_path_unavailable`) |
 | Exit RPC | `exit_rpc_invalid`, `exit_rpc_unsaved` |
-| Sponsored withdrawals (refused before any prompt) | `gasless_unavailable` (`error.data.reason`: `not_pinned`, `gasless_profile_invalid`, `gasless_deployment_mismatch`), `gasless_policy_mismatch`, `bundler_unavailable` (`error.data.fallbacks`), `bundler_wrong_chain`, `bundler_unsupported_entry_point`, `bundler_url_invalid`, `bundler_url_unsaved`, `sponsorship_paused`, `escapes_disabled`, `escape_already_sponsored`, `paymaster_underfunded`, `exits_paused` (`error.data.reopenAt`), `gas_above_paymaster_ceiling` (`error.data`, wei as bigints: `baseFeePerGas`, `maxPriorityFeePerGas`, `neededMaxFeePerGas` = base + tip, the amount compared with the ceiling, `wantedMaxFeePerGas` = 2 × base + tip, `maxFeeCeiling`), `max_cost_above_policy`, `payout_below_gas`, `gasless_uneconomic`, `gasless_attempts_exhausted`, `gasless_fee_above_cap`, `gasless_estimate_above_cap`, `gas_limit_out_of_range` (a gas field outside the paymaster's policy; `error.data`: `name`, `value`, `floor`, `cap`), `gasless_plan_mismatch`, `gasless_record_not_pinned` (`error.data.reason`: `not_pinned`, `pins_mismatch`; recover with `withdraw(mode, …, { fees: 'wallet' })` while the note has not left the vault, then with `sweepTransit`, `claimGaslessCredit` or `finalizeEscape(…, { fees: 'wallet' })`, as `error.data.alternatives` lists them), `wrong_owner_account` (`error.data.expected`), `entry_point_hash_mismatch` |
+| Sponsored withdrawals (refused before any prompt) | `gasless_unavailable` (`error.data.reason`: `not_pinned`, `gasless_profile_invalid`, `gasless_deployment_mismatch`), `gasless_policy_mismatch`, `bundler_unavailable` (`error.data.fallbacks`), `bundler_wrong_chain`, `bundler_unsupported_entry_point`, `bundler_url_invalid`, `bundler_url_unsaved`, `sponsorship_paused`, `escapes_disabled`, `escape_already_sponsored`, `transit_escape_pending` (`error.data`: `transitAccount`, `noteId` of the open escape, `source`: `record` or `paymaster`), `paymaster_underfunded`, `exits_paused` (`error.data.reopenAt`), `gas_above_paymaster_ceiling` (`error.data`, wei as bigints: `baseFeePerGas`, `maxPriorityFeePerGas`, `neededMaxFeePerGas` = base + tip, the amount compared with the ceiling, `wantedMaxFeePerGas` = 2 × base + tip, `maxFeeCeiling`), `max_cost_above_policy`, `payout_below_gas`, `gasless_uneconomic`, `gasless_attempts_exhausted`, `gasless_fee_above_cap`, `gasless_estimate_above_cap`, `gas_limit_out_of_range` (a gas field outside the paymaster's policy; `error.data`: `name`, `value`, `floor`, `cap`), `gasless_plan_mismatch`, `gasless_record_not_pinned` (`error.data.reason`: `not_pinned`, `pins_mismatch`; recover with `withdraw(mode, …, { fees: 'wallet' })` while the note has not left the vault, then with `sweepTransit`, `claimGaslessCredit` or `finalizeEscape(…, { fees: 'wallet' })`, as `error.data.alternatives` lists them), `wrong_owner_account` (`error.data.expected`), `entry_point_hash_mismatch` |
 | Sponsored withdrawals (after a submission) | `signature_rejected` (also a bundler's ERC-7769 `-32507`), `paymaster_underfunded` (also a bundler's `-32508`: the float cannot cover every pending operation; neither code is re-signed), `escape_not_due` (a sponsored finalization the latest block has not reached the deadline for within three minutes; `error.data.validAfter`, `blockTimestamp`), `bundler_hash_mismatch` (a status, the chain decides), `bundler_rejected` (the bundler refused the send with AA25 or AA10 although the chain disagrees; `error.data`: `method`, `aa`, `rpcCode`, `rpcMessage`), `gasless_op_expired` (proved again), `gasless_op_pending` (journaled, checked in the background), `user_op_pending` (`finalizeEscape(…, { fees: 'wallet' })` while a sponsored finalization sent before the profile stopped pinning its paymaster may still land; `error.data.userOpHash`, `retryAfterMs`), `gasless_fee_bump_exhausted`, `gasless_op_reverted` (`error.data.reason`, the vault error; the record may hold `fundsWaitingInTransit`), `transit_funds_waiting` (a forward is sponsored), `transit_sweep_needed` (a status after a wallet-paid exit to `S`, which leaves the paymaster no evidence: only `sweepTransit` collects it), `transit_not_stranded`, `transit_balance_empty`; the EntryPoint's `AA..` reasons map to `sender_already_constructed` and `nonce_rejected` (handled silently), `signature_rejected`, `paymaster_underfunded`, `paymaster_time_window`, `paymaster_rejected` and the paymaster's own errors above |
 
 ## Credited escape payouts
