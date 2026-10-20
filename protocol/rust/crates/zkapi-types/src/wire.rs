@@ -440,11 +440,13 @@ mod tests {
         assert!(serde_json::from_value::<CloseRelayFeeAuthorization>(extra).is_err());
 
         let destination = [17u8; 20];
+        // The leaf-bound close statement (zkapi-v2-concession-v2).
         let inputs = serde_json::json!({
-            "protocol_version":2, "chain_id":11155111, "contract_address":"0x1", "active_root":"0x2",
+            "protocol_version":2, "chain_id":11155111, "contract_address":"0x1", "note_leaf":"0x2",
             "state_signing_key_x":"0x3", "state_signing_key_y":"0x4",
             "clearance_signing_key_x":"0x5", "clearance_signing_key_y":"0x6",
-            "note_id":7, "final_balance":1950000, "destination":destination,
+            "note_id":7, "deposit_amount":2000000, "expiry_ts":4000000000u64,
+            "final_balance":1950000, "destination":destination,
             "withdrawal_nullifier":"0x7", "kind":1, "next_nullifier":"0x0", "conceded":0,
             "valid_until":2000003600u64
         });
@@ -453,6 +455,15 @@ mod tests {
             "ticket_secret":format!("0x{}", "11".repeat(32))});
         let parsed: CloseRelaySubmissionV2C = serde_json::from_value(body.clone()).unwrap();
         assert_eq!(parsed.public_inputs.kind, 1);
+        assert_eq!(parsed.public_inputs.deposit_amount, 2_000_000);
+        // A root-bound (zkapi-v2-concession-v1) close is refused.
+        let mut v1 = body.clone();
+        let fields = v1["public_inputs"].as_object_mut().unwrap();
+        for name in ["note_leaf", "deposit_amount", "expiry_ts"] {
+            fields.remove(name);
+        }
+        fields.insert("active_root".into(), "0x2".into());
+        assert!(serde_json::from_value::<CloseRelaySubmissionV2C>(v1).is_err());
         let mut extra = body;
         extra["fee"] = 1.into();
         assert!(serde_json::from_value::<CloseRelaySubmissionV2C>(extra).is_err());
