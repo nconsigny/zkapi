@@ -1192,7 +1192,7 @@ async function main() {
             const snapshot = await synchronizedTree();
             const params = await client('deposit_params');
             const merkle = await client('tree_path', { args: { snapshot, note_id: snapshot.next_note_id, require_existing: false } });
-            const receipt = await vaultSend(from, 'deposit', [felt(params.registration_commitment), amount, merkle.siblings],
+            const receipt = await vaultSend(from, 'deposit', [felt(params.registration_commitment), amount],
                 { value: BigInt(amount) * GWEI, operation: 'deposit' });
             assert.equal(receipt.status, '0x1');
             const deposited = eventOf(receipt, 'NoteDeposited');
@@ -1697,9 +1697,11 @@ async function main() {
             const recorded = eventOf(receipt, 'EscapeConcessionRecorded');
             assert.equal(recorded.args.conceded, 0n, 'a fresh state escapes conceding nothing');
             assert.equal(recorded.args.stateBalance, BigInt(DEPOSIT - INFERENCE_CHARGE));
-            const pending = await vaultRead('pendingWithdrawals', [noteId]);
-            assert.equal(pending[0], true);
-            const root = pending[1];
+            assert.equal((await vaultRead('pendingWithdrawals', [noteId]))[0], true);
+            // The vault does not store the proof's root (pendingWithdrawals word 1 is zero): the
+            // escape's calldata carries it.
+            const escapeCall = vault.parseTransaction({ data: (await rpc('eth_getTransactionByHash', [escapeTx.hash])).input });
+            const root = BigInt(escapeCall.args.inputs.activeRoot);
             assert.equal(root, depositRoot, 'the escape proves at the note\'s deposit root, not the current one');
             assert.equal(await vaultRead('isKnownRoot', [root]), true);
             await save('sdk-honest-escape.json', escaped);
@@ -1825,7 +1827,7 @@ async function main() {
             assert.equal(bridge.value.exit_concession, 1);
             const plan = await companion.call('POST', '/deposit/prepare', { amount: DEPOSIT });
             assert.equal(plan.status, 200, json(plan.value));
-            const receipt = await vaultSend(account.companion, 'deposit', [felt(plan.value.commitment), DEPOSIT, plan.value.zero_path],
+            const receipt = await vaultSend(account.companion, 'deposit', [felt(plan.value.commitment), DEPOSIT],
                 { value: BigInt(DEPOSIT) * GWEI, operation: 'deposit' });
             const deposited = eventOf(receipt, 'NoteDeposited');
             const noteId = Number(deposited.args.noteId);
@@ -1890,7 +1892,7 @@ async function main() {
         async function companionDeposit(companion, amount = DEPOSIT) {
             const plan = await companion.call('POST', '/deposit/prepare', { amount });
             assert.equal(plan.status, 200, json(plan.value));
-            const receipt = await vaultSend(account.companion, 'deposit', [felt(plan.value.commitment), amount, plan.value.zero_path],
+            const receipt = await vaultSend(account.companion, 'deposit', [felt(plan.value.commitment), amount],
                 { value: BigInt(amount) * GWEI, operation: 'deposit' });
             const deposited = eventOf(receipt, 'NoteDeposited');
             const noteId = Number(deposited.args.noteId);
@@ -3153,9 +3155,12 @@ async function main() {
             gas.record('escape', receipt, { client: 'sdk', conceded: 0, path: 'rebuild' });
             assert.equal(escaped.result?.pathSource, 'rebuild', 'with no saved path and no indexer the path is rebuilt from the logs');
             assert.deepEqual(escaped.result?.decision, { rule: 'E2.escape', conceded: '0' });
-            const pending = await vaultRead('pendingWithdrawals', [noteId]);
-            assert.equal(pending[0], true);
-            assert.equal(pending[1], currentRoot, 'the escape proves at the root rebuilt from the logs, not the deposit root');
+            assert.equal((await vaultRead('pendingWithdrawals', [noteId]))[0], true);
+            // The vault does not store the proof's root (pendingWithdrawals word 1 is zero): the
+            // escape's calldata carries it.
+            const escapeCall = vault.parseTransaction({ data: (await rpc('eth_getTransactionByHash', [escapeTx.hash])).input });
+            const proofRoot = BigInt(escapeCall.args.inputs.activeRoot);
+            assert.equal(proofRoot, currentRoot, 'the escape proves at the root rebuilt from the logs, not the deposit root');
             indexer = launch(path.join(opts.binDir, 'zkapi-indexerd'), indexerArgs, 'indexer-3.log');
             await synchronizedTree();
             const fillerEscape = await driverEscape(filler.client, filler.noteId, { path: filler.depositPath });
@@ -3164,7 +3169,7 @@ async function main() {
             pendingEscapes.push({ name: 'rebuild-filler', client: 'driver', wallet: filler.client, noteId: filler.noteId,
                 destination: account.destination, payout: DEPOSIT, stateBalance: DEPOSIT,
                 exitedNullifier: fillerEscape.plan.public_inputs.withdrawal_nullifier });
-            return { note_id: noteId, path_source: escaped.result.pathSource, proof_root: felt(pending[1]), deposit_root: felt(depositRoot),
+            return { note_id: noteId, path_source: escaped.result.pathSource, proof_root: felt(proofRoot), deposit_root: felt(depositRoot),
                 indexer_down_during_escape: true, escape: escapeTx.hash, decision: escaped.result.decision };
         });
         stopAfter('rebuild');

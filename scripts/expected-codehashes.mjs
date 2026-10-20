@@ -1,22 +1,27 @@
 #!/usr/bin/env node
 // Expected runtime codehashes of a zkAPI deployment (vault revision 3), computed from the
-// pinned-compiler Forge artifacts alone: the vault's deployedBytecode with the Bn254Poseidon
-// link applied and its immutableReferences filled from the constructor arguments, the adapter's
-// deployedBytecode, and the library's deployedBytecode (with its own address in a call-protection
-// prefix, if the compiler emitted one). A deployment with the gasless-withdrawal paymaster adds
+// pinned-compiler Forge artifacts alone: the vault's deployedBytecode with its immutableReferences
+// filled from the constructor arguments (the Poseidon runtime's address among them; the vault links
+// no library), the adapter's deployedBytecode with its immutables filled from the vault, the chain
+// and the signing keys it is folded for (the folded IC points recomputed here on BN254 from the
+// verifying-key constants in the artifact's AST), and the Poseidon runtime's deployedBytecode
+// (Bn254PoseidonRuntime, legacy-compiled, no immutables; the setup's poseidon-runtime.json pins
+// its codehash, which Deploy.s.sol checks). A deployment with the gasless-withdrawal paymaster adds
 // the paymaster's, the transit-account factory's and the account logic's deployedBytecode with
 // their immutables filled the same way, and the two canonical ERC-4337 v0.7.0 runtimes (the
 // EntryPoint and its SenderCreator), which are pinned constants. Anyone can rebuild the artifacts
-// from source (protocol/contracts/foundry.toml pins solc, via_ir, 10,000 runs, bytecode_hash
-// "none" and cbor_metadata false) and audit a deployment.
+// from source (protocol/contracts/foundry.toml pins solc, via_ir (off for the Poseidon runtime),
+// 10,000 runs, bytecode_hash "none" and cbor_metadata false) and audit a deployment. The manifest
+// keeps the field names poseidonLibrary, poseidonLibraryReused and poseidonRuntimeCodehash: they
+// name the Poseidon runtime contract now.
 //
 //   node scripts/expected-codehashes.mjs --deployment .demo/deployment.json [--check] [--rpc URL]
 //   node scripts/expected-codehashes.mjs --deployment .demo/deployment.json.pending --rpc URL \
 //     --finalize .demo/deployment.json [--broadcast-log FILE] [--confirmations N]
 //   node scripts/expected-codehashes.mjs --poseidon 0x.. --note-ttl 2592000 --challenge-period 172800 \
 //     --max-pause-duration 3888000 --request-charge-cap 50000 --proof-adapter 0x.. \
-//     --state-key-x .. --state-key-y .. --clearance-key-x .. --clearance-key-y .. \
-//     [--vault 0x.. --entry-point 0x.. --paymaster 0x.. --factory 0x.. --account-implementation 0x.. \
+//     --state-key-x .. --state-key-y .. --clearance-key-x .. --clearance-key-y .. --vault 0x.. --chain-id 1 \
+//     [--entry-point 0x.. --paymaster 0x.. --factory 0x.. --account-implementation 0x.. \
 //      --wei-per-unit 1000000000 --creation-code-keccak 0x..]
 //
 // --deployment reads Deploy.s.sol's manifest; flags override its fields. --artifacts DIR selects
@@ -228,6 +233,132 @@ function filledRuntimeCode(contract, art, values) {
     return code;
 }
 
+// ------------------------------------------------------- BN254 G1 (the adapter's folded points)
+// Affine arithmetic over the base field, with the identity as (0, 0), exactly as the ecAdd (0x06)
+// and ecMul (0x07) precompiles compute: the adapter's constructor sums its folded points with them,
+// and the expected codehash must hold the same words. Small and slow on purpose (a few curve
+// operations per audit); every input point is checked to be on the curve, as the precompiles do.
+
+export const BN254_BASE_MODULUS = 21888242871839275222246405745257275088696311157297823662689037894645226208583n;
+export const BN254_SCALAR_MODULUS = 21888242871839275222246405745257275088548364400416034343698204186575808495617n;
+const G1_IDENTITY = Object.freeze([0n, 0n]);
+
+const fq = n => ((n % BN254_BASE_MODULUS) + BN254_BASE_MODULUS) % BN254_BASE_MODULUS;
+
+function fqInverse(a) {
+    let [r0, r1] = [fq(a), BN254_BASE_MODULUS];
+    let [s0, s1] = [1n, 0n];
+    if (r0 === 0n) fail('BN254: inverse of zero');
+    while (r1 !== 0n) {
+        const q = r0 / r1;
+        [r0, r1] = [r1, r0 - q * r1];
+        [s0, s1] = [s1, s0 - q * s1];
+    }
+    return fq(s0);
+}
+
+function g1Check(point, label) {
+    const [x, y] = point;
+    if (typeof x !== 'bigint' || typeof y !== 'bigint' || x < 0n || y < 0n || x >= BN254_BASE_MODULUS || y >= BN254_BASE_MODULUS) {
+        fail(`${label}: not a pair of base-field elements`);
+    }
+    if ((x !== 0n || y !== 0n) && fq(y * y - x * x * x - 3n) !== 0n) fail(`${label}: not on BN254`);
+    return point;
+}
+
+/// P + Q as the ecAdd precompile computes it.
+export function g1Add(p, q) {
+    const [x1, y1] = g1Check(p, 'g1Add P');
+    const [x2, y2] = g1Check(q, 'g1Add Q');
+    if (x1 === 0n && y1 === 0n) return [x2, y2];
+    if (x2 === 0n && y2 === 0n) return [x1, y1];
+    let slope;
+    if (x1 === x2) {
+        if (fq(y1 + y2) === 0n) return [...G1_IDENTITY];
+        slope = fq(3n * x1 * x1 * fqInverse(2n * y1));
+    } else {
+        slope = fq((y2 - y1) * fqInverse(x2 - x1));
+    }
+    const x3 = fq(slope * slope - x1 - x2);
+    return [x3, fq(slope * (x1 - x3) - y1)];
+}
+
+/// s · P as the ecMul precompile computes it (any 256-bit scalar).
+export function g1Mul(p, scalar) {
+    g1Check(p, 'g1Mul P');
+    if (typeof scalar !== 'bigint' || scalar < 0n || scalar >= 1n << 256n) fail('g1Mul: not a 256-bit scalar');
+    let result = [...G1_IDENTITY];
+    let addend = [p[0], p[1]];
+    for (let k = scalar; k > 0n; k >>= 1n) {
+        if (k & 1n) result = g1Add(result, addend);
+        addend = g1Add(addend, addend);
+    }
+    return result;
+}
+
+/// Name -> value (BigInt) of every constant with a literal value in an artifact's AST.
+function literalConstants(ast) {
+    if (!ast) fail('artifact has no AST; build with ast = true (foundry.toml)');
+    const values = new Map();
+    const visit = node => {
+        if (Array.isArray(node)) return node.forEach(visit);
+        if (!node || typeof node !== 'object') return;
+        if (node.nodeType === 'VariableDeclaration' && node.constant === true && node.value?.nodeType === 'Literal'
+            && node.value.kind === 'number' && !node.value.subdenomination) {
+            values.set(node.name, BigInt(String(node.value.value).replaceAll('_', '')));
+        }
+        for (const value of Object.values(node)) if (value && typeof value === 'object') visit(value);
+    };
+    visit(ast);
+    return values;
+}
+
+/// The Groth16 IC indices the adapter folds, with the constant of each (input i is IC i + 1, in
+/// the order of Types.RequestPublicInputs / Types.WithdrawalPublicInputs): protocolVersion,
+/// chainId, contractAddress, stateSigningKeyX/Y and, for withdrawals, clearanceSigningKeyX/Y.
+const ADAPTER_FOLDS = Object.freeze({ REQUEST: [1, 2, 3, 5, 6], WITHDRAWAL: [1, 2, 3, 5, 6, 7, 8] });
+const ADAPTER_PROTOCOL_VERSION = 2n;
+
+/// The immutables of Groth16ProofAdapter, by name, as 32-byte hex words: the vault, chain and keys
+/// it is folded for (the vault's own; its constructor stores block.chainid), and the folded points
+/// IC0 + Σ c · IC of both verifying keys, from the IC constants of the artifact being hashed.
+export function adapterImmutables(art, inputs) {
+    const chainId = uint(inputs.chainId, 64, 'chainId');
+    const vault = address(inputs.vault ?? fail('the adapter is folded for the vault: missing vault'), 'vault');
+    const key = name => {
+        const value = uint(inputs[name], 256, name);
+        if (value >= BN254_SCALAR_MODULUS) fail(`${name} is not below the BN254 scalar field order`);
+        return value;
+    };
+    const keys = ['stateSigningKeyX', 'stateSigningKeyY', 'clearanceSigningKeyX', 'clearanceSigningKeyY'].map(key);
+    const scalars = [ADAPTER_PROTOCOL_VERSION, chainId, BigInt(vault), ...keys];
+    const constants = literalConstants(art.ast);
+    const ic = (prefix, index) => {
+        const name = `${prefix}_IC${index}`;
+        const x = constants.get(`${name}_X`) ?? fail(`Groth16ProofAdapter has no constant ${name}_X`);
+        const y = constants.get(`${name}_Y`) ?? fail(`Groth16ProofAdapter has no constant ${name}_Y`);
+        return g1Check([x, y], `Groth16ProofAdapter ${name}`);
+    };
+    const folded = prefix => ADAPTER_FOLDS[prefix].reduce(
+        (sum, point, k) => g1Add(sum, g1Mul(ic(prefix, point), scalars[k])),
+        ic(prefix, 0),
+    );
+    const [requestX, requestY] = folded('REQUEST');
+    const [withdrawalX, withdrawalY] = folded('WITHDRAWAL');
+    return {
+        foldedChainId: word(chainId, 'chainId'),
+        foldedVault: word(vault, 'vault'),
+        foldedStateSigningKeyX: word(keys[0], 'stateSigningKeyX'),
+        foldedStateSigningKeyY: word(keys[1], 'stateSigningKeyY'),
+        foldedClearanceSigningKeyX: word(keys[2], 'clearanceSigningKeyX'),
+        foldedClearanceSigningKeyY: word(keys[3], 'clearanceSigningKeyY'),
+        foldedRequestIc0X: word(requestX, 'foldedRequestIc0X'),
+        foldedRequestIc0Y: word(requestY, 'foldedRequestIc0Y'),
+        foldedWithdrawalIc0X: word(withdrawalX, 'foldedWithdrawalIc0X'),
+        foldedWithdrawalIc0Y: word(withdrawalY, 'foldedWithdrawalIc0Y'),
+    };
+}
+
 // ------------------------------------------------------------------------------- codehashes
 
 /// The constructor-derived immutables of ZkApiVault, by name, as 32-byte hex words.
@@ -250,6 +381,7 @@ export function vaultImmutables(inputs) {
         clearanceSigningKeyX: word(inputs.clearanceSigningKeyX, 'clearanceSigningKeyX'),
         clearanceSigningKeyY: word(inputs.clearanceSigningKeyY, 'clearanceSigningKeyY'),
         maxPauseDuration: word(maxPauseDuration, 'maxPauseDuration'),
+        poseidon: word(address(inputs.poseidonLibrary, 'poseidonLibrary'), 'poseidonLibrary'),
     };
 }
 
@@ -366,22 +498,11 @@ export function hasGasless(inputs) {
 }
 
 export function expectedRuntimeCode(artifactsDir, inputs) {
-    const poseidon = address(inputs.poseidonLibrary, 'poseidonLibrary').slice(2);
-
     const vaultArtifact = artifact(artifactsDir, 'ZkApiVault');
     let vault = vaultArtifact.deployedBytecode.object.replace(/^0x/, '');
-    const links = vaultArtifact.deployedBytecode.linkReferences ?? {};
-    let linked = 0;
-    for (const [file, libraries] of Object.entries(links)) {
-        for (const [name, refs] of Object.entries(libraries)) {
-            if (name !== 'Bn254Poseidon') fail(`ZkApiVault links an unexpected library ${file}:${name}`);
-            for (const ref of refs) {
-                vault = patch(vault, ref.start, ref.length, poseidon);
-                ++linked;
-            }
-        }
+    if (Object.keys(vaultArtifact.deployedBytecode.linkReferences ?? {}).length) {
+        fail('ZkApiVault links a library: the artifacts predate the Poseidon runtime (rebuild)');
     }
-    if (linked === 0) fail('ZkApiVault has no Bn254Poseidon link reference');
     const names = immutableNames(vaultArtifact.ast);
     const values = vaultImmutables(inputs);
     const filled = new Set();
@@ -395,20 +516,15 @@ export function expectedRuntimeCode(artifactsDir, inputs) {
     if (/[^0-9a-fA-F]/.test(vault)) fail('ZkApiVault runtime code still has an unlinked placeholder');
 
     const adapterArtifact = artifact(artifactsDir, 'Groth16ProofAdapter');
-    const adapterRefs = adapterArtifact.deployedBytecode;
-    if (Object.keys(adapterRefs.linkReferences ?? {}).length || Object.keys(adapterRefs.immutableReferences ?? {}).length) {
-        fail('Groth16ProofAdapter is expected to have no links and no immutables');
-    }
-    const adapter = adapterRefs.object.replace(/^0x/, '');
+    const adapter = filledRuntimeCode('Groth16ProofAdapter', adapterArtifact, adapterImmutables(adapterArtifact, inputs));
 
-    const libraryArtifact = artifact(artifactsDir, 'Bn254Poseidon');
-    let library = libraryArtifact.deployedBytecode.object.replace(/^0x/, '');
-    // A library with call protection starts with PUSH20 <its own address>, written at deployment.
-    // Bn254Poseidon's via-IR code has none (all its functions are pure), so its code does not
-    // depend on its address.
-    if (library.startsWith('73' + '0'.repeat(40))) library = patch(library, 1, 20, poseidon);
+    // The Poseidon runtime: legacy-compiled, no immutables, no links, so its runtime code is the
+    // artifact's as it stands.
+    const runtimeArtifact = artifact(artifactsDir, 'Bn254PoseidonRuntime');
+    const runtime = filledRuntimeCode('Bn254PoseidonRuntime', runtimeArtifact, {});
+    if (runtimeArtifact.metadata?.settings?.viaIR) fail('Bn254PoseidonRuntime was compiled with via_ir; its pinned codehash is the legacy pipeline\'s');
 
-    const code = { vault: `0x${vault}`, adapter: `0x${adapter}`, poseidon: `0x${library}` };
+    const code = { vault: `0x${vault}`, adapter: `0x${adapter}`, poseidon: `0x${runtime}` };
     if (!hasGasless(inputs)) return code;
     const immutables = gaslessImmutables(inputs);
     code.paymaster = `0x${filledRuntimeCode('ZkApiWithdrawalPaymaster', artifact(artifactsDir, 'ZkApiWithdrawalPaymaster'), immutables.paymaster)}`;
@@ -513,12 +629,14 @@ export function deploymentInputs(deployment, overrides = {}) {
         stateSigningKeyY: deployment.stateSigningKeyY,
         clearanceSigningKeyX: deployment.clearanceSigningKeyX,
         clearanceSigningKeyY: deployment.clearanceSigningKeyY,
+        // The adapter is folded for the vault and its chain.
+        vault: deployment.vault,
+        chainId: deployment.chainId,
         withdrawalPaymaster: deployment.withdrawalPaymaster ?? null,
         ...overrides,
     };
     if (hasGasless(inputs)) {
         Object.assign(inputs, {
-            vault: deployment.vault,
             entryPoint: deployment.entryPoint ?? CANONICAL_ENTRY_POINT,
             withdrawalAccountFactory: deployment.withdrawalAccountFactory,
             withdrawalAccountImplementation: deployment.withdrawalAccountImplementation,
@@ -739,6 +857,7 @@ const FLAGS = {
     '--clearance-key-x': 'clearanceSigningKeyX',
     '--clearance-key-y': 'clearanceSigningKeyY',
     '--vault': 'vault',
+    '--chain-id': 'chainId',
     '--entry-point': 'entryPoint',
     '--paymaster': 'withdrawalPaymaster',
     '--factory': 'withdrawalAccountFactory',
