@@ -155,9 +155,11 @@ allows. See [the operator's close relay](docs/CLI_ZKAPI.md#the-operators-close-r
 
 For chain and protocol access the client uses only the RPC, zkAPI indexer and
 protocol server packaged with the release. A deposit activates only after the
-vault, read at the deposit's block, and the indexer's whole-tree snapshot both
-show it at the same note; a withdrawal finishes only after both show the note
-closed. A withdrawal first proves note ownership to the protocol server, which
+vault, read at the deposit's block, and a second source show it at the same
+note: the indexer's whole-tree snapshot, or, while the indexer has no view of
+that block, your exit RPC (without one the deposit waits for the indexer); a
+withdrawal finishes only after the vault shows the note closed at the payout
+block, through your exit RPC as well when one is set. A withdrawal first proves note ownership to the protocol server, which
 then clears the cooperative close. When the operator cannot or will not
 clear it, `zkapi-clientd withdraw --escape --to ADDRESS` exits through the
 vault alone, after its challenge period. See
