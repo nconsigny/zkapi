@@ -2,7 +2,7 @@
   "schema": 2,
   "circuitId": "zkapi-v2-concession-v2",
   "setupId": "dev",
-  "sourceRevision": "a946c73f1ee92790669b1527a8ca68ca77ed6911",
+  "sourceRevision": "17c5177f21237bbb5602d592a3970c1418dd6d27",
   "toolchain": {
     "rustc": "1.99.0",
     "wasmBindgen": "0.2.117"
@@ -13,7 +13,7 @@
   },
   "files": {
     "wasm/zkapi_browser.js": "57df7f37795517c5ead23647241afd811d6f27c31abe407f85d97f521ea07871",
-    "wasm/zkapi_browser_bg.wasm": "41031c1632c45018fd01dccaa883f5cbcb26df6616df5a8e0939620a3a3e4fff",
+    "wasm/zkapi_browser_bg.wasm": "d75e588ec46da57f4634b2bc3ed31f7f0c8379d3be6ca09ad2e2520982da818a",
     "wasm/zkapi_browser.d.ts": "d6f1bff11a642c0e7121f40003c90a8ce9bf806a451c640679f93c0a34cea01f",
     "wasm/zkapi_browser_bg.wasm.d.ts": "2f545577a81368941bceb6b3121d20e52449f8522020629e630bfafd81537219",
     "assets/proofs/request.pk": "fb5f0ec0908b29aa5a3ba75c5cefda70ca0bc1d68da031c4a21ef63c0806af87",
