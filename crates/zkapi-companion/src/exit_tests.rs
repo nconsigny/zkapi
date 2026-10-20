@@ -2271,12 +2271,6 @@ async fn a_refusal_recorded_for_an_earlier_state_does_not_steer_this_one() {
     assert_eq!(decision["reason"], "mutual_refused", "{decision}");
 }
 
-/// The close relay from the wallet: the fee is one request at the current
-/// state whose successor installs with the fee deducted (idempotently), the
-/// close is then reserved and proved at that successor, and the relay gets
-/// exactly that close with the ticket secret whose hash the fee request
-/// named. Refused without a relay, and once a withdrawal is reserved.
-
 /// The relay fee request is proved at a root the vault reports, which the
 /// server admits once it has read it itself (vault revision 4): an unsigned
 /// stale_root while the pinned vault still holds that root is a lagging
@@ -2359,6 +2353,11 @@ async fn a_relay_fee_refused_as_stale_while_the_vault_holds_its_root_is_resent()
     assert!(!harness.wallet().has_pending_request(), "set aside");
 }
 
+/// The close relay from the wallet: the fee is one request at the current
+/// state whose successor installs with the fee deducted (idempotently), the
+/// close is then reserved and proved at that successor, and the relay gets
+/// exactly that close with the ticket secret whose hash the fee request
+/// named. Refused without a relay, and once a withdrawal is reserved.
 #[tokio::test]
 async fn the_relay_fee_is_one_request_and_the_close_is_relayed_with_its_ticket() {
     let harness = Harness::new().await;
