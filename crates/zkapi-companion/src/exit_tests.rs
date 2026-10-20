@@ -91,6 +91,9 @@ struct World {
     relay_fee: Option<u128>,
     relay_fee_requests: Vec<zkapi_types::wire::ApiRequestV2>,
     relay_submissions: Vec<Value>,
+    /// The next fee requests answered with an unsigned stale_root (a server
+    /// that has not read the vault's root yet).
+    relay_fee_stale: usize,
 }
 
 type Shared = Arc<Mutex<World>>;
@@ -417,6 +420,17 @@ async fn relay_fee_route(
     let mut world = world.lock().unwrap();
     let fee = world.relay_fee.unwrap();
     world.relay_fee_requests.push(request.clone());
+    if world.relay_fee_stale > 0 {
+        world.relay_fee_stale -= 1;
+        return (
+            StatusCode::CONFLICT,
+            Json(
+                json!({"status": "error", "client_request_id": request.client_request_id,
+                "error_code": "stale_root", "error_message": "stale root", "retriable": true}),
+            ),
+        )
+            .into_response();
+    }
     Json(signed_successor(
         &request,
         fee,
@@ -2229,6 +2243,89 @@ async fn a_refusal_recorded_for_an_earlier_state_does_not_steer_this_one() {
 /// close is then reserved and proved at that successor, and the relay gets
 /// exactly that close with the ticket secret whose hash the fee request
 /// named. Refused without a relay, and once a withdrawal is reserved.
+
+/// The relay fee request is proved at a root the vault reports, which the
+/// server admits once it has read it itself (vault revision 4): an unsigned
+/// stale_root while the pinned vault still holds that root is a lagging
+/// server, so the byte-identical request is sent again; a server that still
+/// lags after every resend leaves the request journaled and the ticket kept.
+/// Once the vault's root moved, a stale_root sets the request aside.
+#[tokio::test]
+async fn a_relay_fee_refused_as_stale_while_the_vault_holds_its_root_is_resent() {
+    let harness = Harness::new().await;
+    let fee = 250_000;
+    {
+        let mut world = harness.world.lock().unwrap();
+        world.relay_fee = Some(fee);
+        world.relay_fee_stale = 1;
+    }
+    let paid = harness.service.close_relay_fee().await.unwrap();
+    assert_eq!(paid["status"], "paid");
+    {
+        let world = harness.world.lock().unwrap();
+        assert_eq!(world.relay_fee_requests.len(), 2, "one resend");
+        assert_eq!(
+            serde_json::to_value(&world.relay_fee_requests[1]).unwrap(),
+            serde_json::to_value(&world.relay_fee_requests[0]).unwrap()
+        );
+    }
+    assert_eq!(
+        harness.wallet().state().unwrap().current_balance,
+        DEPOSIT - fee
+    );
+
+    // Lagging past every resend: kept, then paid with the same request.
+    let harness = Harness::new().await;
+    {
+        let mut world = harness.world.lock().unwrap();
+        world.relay_fee = Some(fee);
+        world.relay_fee_stale = 1 + crate::service::STALE_ROOT_RESEND_DELAYS.len();
+    }
+    let error = harness.service.close_relay_fee().await.unwrap_err();
+    assert!(matches!(error, AuthError::PendingSettlement), "{error:?}");
+    assert!(
+        harness.wallet().has_pending_request(),
+        "the request stays journaled"
+    );
+    let paid = harness.service.close_relay_fee().await.unwrap();
+    assert_eq!(paid["status"], "paid");
+    {
+        let world = harness.world.lock().unwrap();
+        let first = serde_json::to_value(&world.relay_fee_requests[0]).unwrap();
+        assert!(world
+            .relay_fee_requests
+            .iter()
+            .all(|request| serde_json::to_value(request).unwrap() == first));
+    }
+
+    // The vault's root moved: the stale request is set aside, not resent.
+    let harness = Harness::new().await;
+    {
+        let mut world = harness.world.lock().unwrap();
+        world.relay_fee = Some(fee);
+        world.relay_fee_stale = 1;
+    }
+    let moved = harness.world.clone();
+    let probe = tokio::spawn(async move {
+        // Move the root as soon as the request is on its way.
+        loop {
+            {
+                let mut world = moved.lock().unwrap();
+                if !world.relay_fee_requests.is_empty() {
+                    world.vault_root = Felt252::from_u64(0x99);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    });
+    let error = harness.service.close_relay_fee().await.unwrap_err();
+    probe.await.unwrap();
+    assert!(error.to_string().contains("stale"), "{error}");
+    assert_eq!(harness.world.lock().unwrap().relay_fee_requests.len(), 1);
+    assert!(!harness.wallet().has_pending_request(), "set aside");
+}
+
 #[tokio::test]
 async fn the_relay_fee_is_one_request_and_the_close_is_relayed_with_its_ticket() {
     let harness = Harness::new().await;

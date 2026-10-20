@@ -49,17 +49,17 @@ use zkapi_types::{Felt252, WithdrawalPublicInputsV2C};
 /// Waits before resending a byte-identical lease request that the server
 /// called stale while the pinned vault still has its root.
 #[cfg(not(test))]
-const STALE_ROOT_RESEND_DELAYS: [Duration; 4] = [
+pub(crate) const STALE_ROOT_RESEND_DELAYS: [Duration; 4] = [
     Duration::from_secs(2),
     Duration::from_secs(4),
     Duration::from_secs(8),
     Duration::from_secs(16),
 ];
 #[cfg(test)]
-const STALE_ROOT_RESEND_DELAYS: [Duration; 4] = [Duration::from_millis(1); 4];
+pub(crate) const STALE_ROOT_RESEND_DELAYS: [Duration; 4] = [Duration::from_millis(1); 4];
 
 /// `currentRoot()` of the vault.
-const VAULT_CURRENT_ROOT_SELECTOR: &str = "0xfdab463d";
+pub(crate) const VAULT_CURRENT_ROOT_SELECTOR: &str = "0xfdab463d";
 
 fn reserve_oa_bridge_lease(state_dir: &Path, lease_id: &str) -> Result<(), AuthError> {
     use sha3::{Digest, Keccak256};

@@ -2146,9 +2146,11 @@ async function main() {
             await sdk('init');
             const deposited = await sdk('deposit', { amount: '0.001' });
             const sdkNoteId = Number(deposited.note.note_id);
-            // The fee request proves at the indexer's tree: wait until it
-            // holds the new note (the SDK does not wait for the indexer).
-            await synchronizedTree();
+            // No wait for the indexer right after the deposit: the SDK proves
+            // the fee request at a root the vault reports (the indexer's path
+            // only once the vault confirms its root, else rebuilt from vault
+            // state), and resends it while serverd has not read that root yet
+            // and the vault still holds it.
             await sdk('close_relay_timing', { timing: { pollMs: 1_000 } });
             const sdkDestination = '0x000000000000000000000000000000000000c1a2';
             const before = await balances(vaultAddress, treasury, driverDestination, sdkDestination, relayer);

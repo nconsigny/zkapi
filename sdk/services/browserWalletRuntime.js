@@ -3008,23 +3008,65 @@ class BrowserWalletRuntime extends EventTarget {
 
     /** POST the journaled fee request and install its signed successor. */
     async sendCloseRelayFeeLocked(request, { onProgress = () => {}, signal = null } = {}) {
+        // `closeRelayFeeTiming` ({ delays, sleep }) is for tests.
+        const { delays: staleRootDelays = STALE_ROOT_RETRY_DELAYS_MS, sleep = delay } = this.closeRelayFeeTiming || {};
         onProgress('relay_fee', 'Paying the relay fee…');
+        const post = () => this.remoteJson(`${this.config.funding.protocol_server_url}/v2/withdraw/relay/fee`, {
+            method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(request), signal
+        });
+        // Whether the vault still holds the root the request was proved at.
+        const vaultHoldsRoot = async () => {
+            try {
+                return sameFelt(await this.vaultWord(VAULT_SELECTORS.currentRoot, signal), request.public_inputs?.active_root);
+            } catch (readError) {
+                if (isAbortError(readError, signal)) throw readError;
+                return false;
+            }
+        };
         let response;
         try {
-            response = await this.remoteJson(`${this.config.funding.protocol_server_url}/v2/withdraw/relay/fee`, {
-                method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(request), signal
-            });
-        } catch (error) {
-            if (['stale_root', 'relay_fee_changed', 'relay_ticket_taken'].includes(error?.code)) {
-                // Never admitted: set aside (a later receipt still installs
-                // from the archive) and start over with fresh terms.
-                const record = this.tryRequestJournalRecord(this.runtime.journal, this.runtime.state, {
-                    disposition: 'discarded_stale_root',
-                    observations: [requestObservation('unaccepted', 'recovery')]
-                });
-                await this.commit({ ...this.runtime, journal: null, closeRelay: null }, record ? { requestArchive: [record] } : {});
+            response = await post();
+        } catch (first) {
+            let error = first;
+            // The request was proved at a root the vault reported, which the
+            // server admits once it has read it itself (vault revision 4). A
+            // stale_root while the vault still holds that root means the
+            // server lags (as right after a deposit): the byte-identical
+            // request is sent again, as for a lease (recoverStaleRootRequest),
+            // and the journal is kept if it still lags after the retries.
+            let held = false;
+            if (error?.code === 'stale_root') {
+                for (const wait of [...staleRootDelays, null]) {
+                    held = await vaultHoldsRoot();
+                    if (!held || wait == null) break;
+                    onProgress('waiting', 'The private service is catching up with the vault. Retrying the relay fee…');
+                    await sleep(wait, signal);
+                    try {
+                        response = await post();
+                        error = null;
+                        break;
+                    } catch (retryError) {
+                        error = retryError;
+                        if (retryError?.code !== 'stale_root') break;
+                    }
+                }
             }
-            throw error;
+            if (error) {
+                if (error.code === 'stale_root' && held) {
+                    error.journalRetained = true;
+                    throw error;
+                }
+                if (['stale_root', 'relay_fee_changed', 'relay_ticket_taken'].includes(error?.code)) {
+                    // Never admitted: set aside (a later receipt still installs
+                    // from the archive) and start over with fresh terms.
+                    const record = this.tryRequestJournalRecord(this.runtime.journal, this.runtime.state, {
+                        disposition: 'discarded_stale_root',
+                        observations: [requestObservation('unaccepted', 'recovery')]
+                    });
+                    await this.commit({ ...this.runtime, journal: null, closeRelay: null }, record ? { requestArchive: [record] } : {});
+                }
+                throw error;
+            }
         }
         const installed = await this.installRecoveredResponse(request.client_request_id, onProgress, { response, signal });
         if (installed !== true) throw new Error('The relay fee receipt could not be applied to this balance.');

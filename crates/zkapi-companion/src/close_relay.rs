@@ -351,19 +351,40 @@ impl AuthService {
                 save_ticket(&config, &ticket)?;
                 request
             };
-            let (status, body) = runtime.block_on(server(
-                &config,
-                reqwest::Method::POST,
-                "/v2/withdraw/relay/fee",
-                Some(serde_json::to_value(&request).map_err(|error| {
-                    AuthError::Serialization(error.to_string())
-                })?),
-            ))?;
-            if !status.is_success() {
+            let body_json = serde_json::to_value(&request)
+                .map_err(|error| AuthError::Serialization(error.to_string()))?;
+            let mut resends = super::STALE_ROOT_RESEND_DELAYS.iter();
+            let body = loop {
+                let (status, body) = runtime.block_on(server(
+                    &config,
+                    reqwest::Method::POST,
+                    "/v2/withdraw/relay/fee",
+                    Some(body_json.clone()),
+                ))?;
+                if status.is_success() {
+                    break body;
+                }
                 let error = serde_json::from_slice::<ErrorResponse>(&body).ok();
-                if error.as_ref().is_some_and(|error| {
-                    error.error_code == "stale_root" || error.error_code == "relay_fee_changed"
-                }) {
+                let code = error.as_ref().map(|error| error.error_code.as_str());
+                if code == Some("stale_root") {
+                    // The request was proved at a root the vault reported;
+                    // the server admits it once it has read that root itself
+                    // (vault revision 4). While the pinned vault still holds
+                    // it the server lags (as right after a deposit): the
+                    // byte-identical request is sent again, as for a lease,
+                    // and kept journaled if the server still lags.
+                    let held = runtime
+                        .block_on(vault_current_root(&config))
+                        .is_ok_and(|root| root == request.public_inputs.active_root);
+                    if held {
+                        if let Some(delay) = resends.next() {
+                            std::thread::sleep(*delay);
+                            continue;
+                        }
+                        return Err(AuthError::PendingSettlement);
+                    }
+                }
+                if matches!(code, Some("stale_root" | "relay_fee_changed")) {
                     // Never admitted: set aside (a later receipt still
                     // installs from the archive) and start over next time.
                     wallet.archive_pending_request(zkapi_client::exit_policy::disposition::DISCARDED_STALE_ROOT)?;
@@ -371,7 +392,7 @@ impl AuthService {
                         .map_err(|_| storage_error())?;
                 }
                 return Err(server_refusal(status, &body));
-            }
+            };
             let response: RequestResponseV2 = serde_json::from_slice(&body)
                 .map_err(|error| AuthError::Serialization(error.to_string()))?;
             if response.charge_applied != ticket.fee_units {
@@ -471,6 +492,24 @@ impl AuthService {
         })
         .await
     }
+}
+
+/// The pinned vault's `currentRoot()` at `latest`, through the deployment's
+/// RPC.
+async fn vault_current_root(config: &AuthConfig) -> Result<Felt252, AuthError> {
+    let url = config
+        .demo_rpc_url
+        .as_deref()
+        .ok_or_else(|| AuthError::Wallet("the deployment names no RPC".into()))?;
+    let rpc = crate::chain::Rpc::new(url)?.on_chain(config.chain_id);
+    let vault = crate::chain::vault_address(&config.contract_address)?;
+    let word = rpc
+        .call(&vault, super::VAULT_CURRENT_ROOT_SELECTOR, "latest")
+        .await?;
+    word.strip_prefix("0x")
+        .filter(|hex| hex.len() == 64)
+        .and_then(|hex| Felt252::from_hex(hex).ok())
+        .ok_or_else(|| AuthError::Wallet("invalid vault root".into()))
 }
 
 #[cfg(test)]

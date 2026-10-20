@@ -42,7 +42,8 @@ async function scenario() {
     const h = createHarness(function SharedRuntime() { return runtime; });
     h.worker.mutate = plan => { plan.proof.proof = Buffer.alloc(256, h.worker.proofs).toString('base64'); };
     h.server.clearance = body => ({ status: 'ok', withdrawal_nullifier: body.withdrawal_nullifier, signature: { r: '0x1', s: '0x2' } });
-    const relay = { enabled: true, fees: [], submissions: [], status: 'queued', charge: FEE, feeError: null, calls: [] };
+    const relay = { enabled: true, fees: [], submissions: [], status: 'queued', charge: FEE, feeError: null, feeErrors: [], calls: [] };
+    runtime.closeRelayFeeTiming = { delays: [0, 0], sleep: async () => {} };
     const base = runtime.remoteJson;
     runtime.remoteJson = async (url, init = {}) => {
         const method = init.method || 'GET';
@@ -54,6 +55,7 @@ async function scenario() {
         if (method === 'POST' && path === '/v2/withdraw/relay/fee') {
             const request = JSON.parse(init.body);
             relay.fees.push(request);
+            if (relay.feeErrors.length) throw relay.feeErrors.shift();
             if (relay.feeError) throw relay.feeError;
             const payload = JSON.parse(request.payload);
             const journal = (await store.readBrowserWallet()).journal;
@@ -157,6 +159,57 @@ test('the relay fee is one proved request, installed with exactly the fee, and i
     assert.deepEqual(await runtime.payCloseRelayFee(), paid);
     assert.equal(relay.fees.length, 1);
     assert.equal(h.workerOperations('prepareRequest').length, 1);
+});
+
+/** An unsigned stale_root reply, as remoteJson throws it. */
+const staleRoot = () => Object.assign(new Error('stale root'), { status: 409, code: 'stale_root' });
+
+test('a relay fee refused as stale_root while the vault still holds its root is sent again: the server lags', async () => {
+    const { h, relay } = await scenario();
+    relay.feeErrors.push(staleRoot());
+    const paid = await runtime.payCloseRelayFee();
+    assert.equal(paid.status, 'paid');
+    assert.equal(relay.fees.length, 2, 'one retry');
+    assert.deepEqual(relay.fees[1], relay.fees[0], 'the byte-identical request');
+    assert.equal(h.workerOperations('prepareRequest').length, 1, 'proved once');
+
+    // Still lagging after every retry: the journal and the ticket are kept.
+    const lagging = await scenario();
+    lagging.relay.feeErrors.push(staleRoot(), staleRoot(), staleRoot());
+    await assert.rejects(runtime.payCloseRelayFee(), error => error.code === 'stale_root' && error.journalRetained === true);
+    assert.equal(lagging.relay.fees.length, 3);
+    const kept = await store.readBrowserWallet();
+    assert.ok(kept.journal, 'the transmitted request stays journaled');
+    assert.equal(kept.closeRelay.phase, 'sent');
+    // The next call resends that very request.
+    const paidLater = await runtime.payCloseRelayFee();
+    assert.equal(paidLater.status, 'paid');
+    assert.deepEqual(lagging.relay.fees[3], lagging.relay.fees[0]);
+    assert.equal(lagging.h.workerOperations('prepareRequest').length, 1);
+});
+
+test('a relay fee refused as stale_root after the vault root moved is set aside, never retried', async () => {
+    const { h, relay } = await scenario();
+    relay.feeErrors.push(staleRoot());
+    const root = h.chain.root;
+    // The vault's root moves once the request is on its way.
+    const base = runtime.remoteJson;
+    runtime.remoteJson = async (url, init = {}) => {
+        if ((init.method || 'GET') === 'POST' && url.endsWith('/v2/withdraw/relay/fee')) h.chain.root = '0x99';
+        return base(url, init);
+    };
+    try {
+        await assert.rejects(runtime.payCloseRelayFee(), error => error.code === 'stale_root' && !error.journalRetained);
+    } finally {
+        runtime.remoteJson = base;
+        h.chain.root = root;
+    }
+    assert.equal(relay.fees.length, 1, 'no retry at a root the vault no longer holds');
+    const after = await store.readBrowserWallet();
+    assert.equal(after.journal, null);
+    assert.equal(after.closeRelay, null, 'the next attempt starts over with a fresh ticket');
+    const archived = await store.listBrowserRequestArchive(DEPLOYMENT);
+    assert.ok(archived.some(entry => entry.disposition === 'discarded_stale_root'), JSON.stringify(archived.map(entry => entry.disposition)));
 });
 
 test('a relay fee receipt that charges another amount is never installed; no relay refuses before proving', async () => {
